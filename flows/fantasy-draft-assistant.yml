@@ -1,19 +1,19 @@
 id: fantasy-draft-assistant
-namespace: fantasy
+namespace: test.robs-test
 description: |
   Fantasy Football Draft Decision Assistant
-  
-  This workflow monitors your ESPN fantasy football draft in real-time
+
+  This workflow monitors your Sleeper fantasy football draft in real-time
   and provides recommendations for available players based on value scoring.
-  
+
   Configuration:
-  1. Set ESPN_LEAGUE_ID environment variable to your league ID
+  1. Set SLEEPER_LEAGUE_ID environment variable to your league ID
   2. Adjust polling frequency in the cron expression (currently every 30 seconds)
   3. Monitor logs during your draft for alerts and recommendations
   '
 
 variables:
-  ESPN_LEAGUE_ID: ""  # Set this via environment or UI
+  SLEEPER_LEAGUE_ID: "926225845410648064"  # Set this via environment or UI
 
 # Trigger: Manual for MVP, or use schedule if you want to run during specific windows
 tasks:
@@ -24,16 +24,16 @@ tasks:
     beforeCommands:
       - pip install requests pandas pytz aiohttp
     commands:
-      - python /home/claude/fantasy_football_analyzer.py
+      - python ./fantasy_football_analyzer.py
     env:
-      ESPN_LEAGUE_ID: "{{ env.ESPN_LEAGUE_ID }}"
+      SLEEPER_LEAGUE_ID: "{{ env.SLEEPER_LEAGUE_ID }}"
     outputFiles:
       - draft_analysis.json
     
   - id: parse-analysis
     type: io.kestra.plugin.core.http.Request
     method: GET
-    url: "file:///home/claude/draft_analysis.json"
+    url: "draft_analysis.json"
     
   - id: check-for-alerts
     type: io.kestra.plugin.core.flow.If
