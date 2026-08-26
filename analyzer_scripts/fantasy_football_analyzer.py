@@ -1,270 +1,629 @@
 #!/usr/bin/env python3
 """
 Fantasy Football Draft Decision Assistant
-Analyzes a live Sleeper draft and recommends high-value picks
+
+Polls a live Sleeper draft and reports the best-value players still on the
+board, so an orchestrator (Kestra) can alert you when something good falls.
+
+Configuration is entirely via environment variables:
+
+  SLEEPER_LEAGUE_ID   League to watch. Required unless SLEEPER_DRAFT_ID is set.
+  SLEEPER_DRAFT_ID    Watch a draft directly, skipping the league lookup.
+                      Useful for mock drafts, which have no league.
+  SLEEPER_USER_ID     Your Sleeper user id. When set, the analysis reports
+                      whether the draft is currently on your clock.
+  SLEEPER_BASE_URL    API root. Overridable for testing against a fixture.
+  ALERT_THRESHOLD     Value score above which a player is flagged. Default 10.
+  TOP_N               How many recommendations to return. Default 5.
+  EXCLUDE_POSITIONS   Comma-separated positions to drop, e.g. "K,DEF".
+  OUTPUT_FILE         Where to write the analysis JSON. Default draft_analysis.json.
+  PLAYERS_CACHE_PATH  Where to cache the player pool. Default sleeper_players_cache.json.
+
+Writes the analysis to OUTPUT_FILE and emits it to stdout in Kestra's
+script-output format so downstream tasks can branch on it.
 """
 
-import requests
 import json
 import os
+import sys
+import tempfile
 import time
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Set
 
-PLAYERS_CACHE_PATH = "sleeper_players_cache.json"
-PLAYERS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60  # Sleeper asks this endpoint be hit at most once/day
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+DEFAULT_BASE_URL = "https://api.sleeper.app/v1"
+
+# Positions Sleeper uses for standard fantasy rosters. Everything else in the
+# player pool (OL, IDP, etc.) is noise for a redraft league.
+FANTASY_POSITIONS = frozenset({"QB", "RB", "WR", "TE", "K", "DEF"})
+
+# Sleeper stores "no meaningful rank" as this sentinel rather than null.
+UNRANKED_SENTINEL = 9999999
+
+# Sleeper asks that the ~14MB player endpoint be hit at most once per day.
+PLAYERS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+PLAYERS_CACHE_VERSION = 2
+
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+class SleeperError(RuntimeError):
+    """Raised when Sleeper cannot give us what we need to run an analysis."""
+
+
+def _log(message: str) -> None:
+    """Human-readable progress.
+
+    Deliberately stdout, not stderr: Kestra logs a script's stderr at ERROR
+    level, which would paint routine progress lines red in the UI. Kestra
+    only treats stdout lines wrapped in ``::...::`` as output directives and
+    logs everything else at INFO, so plain text is safe here as long as it
+    never begins with ``::``.
+    """
+    print(message, flush=True)
+
+
+def emit_kestra(payload: Dict) -> None:
+    """Emit a Kestra script-output/metric directive on stdout."""
+    print("::" + json.dumps(payload) + "::", flush=True)
 
 
 class SleeperFantasyAnalyzer:
-    def __init__(self, league_id: str):
+    def __init__(
+        self,
+        league_id: Optional[str] = None,
+        draft_id: Optional[str] = None,
+        base_url: str = DEFAULT_BASE_URL,
+        user_id: Optional[str] = None,
+    ):
         """
-        Initialize Sleeper Fantasy Football analyzer
-
         Args:
-            league_id: Your Sleeper league ID (visible in the league URL)
+            league_id: Sleeper league id (visible in the league URL).
+            draft_id: Draft id, if watching a draft directly.
+            base_url: API root, overridable for tests.
+            user_id: Your Sleeper user id, for on-the-clock detection.
         """
+        if not league_id and not draft_id:
+            raise SleeperError("Either a league id or a draft id is required")
+
         self.league_id = league_id
-        self.base_url = "https://api.sleeper.app/v1"
-        self.session = requests.Session()
+        self.draft_id = draft_id
+        self.user_id = user_id
+        self.base_url = base_url.rstrip("/")
+        self.session = self._build_session()
+        # Set when the player pool came from Sleeper rather than the cache, so
+        # the caller knows the on-disk cache is worth persisting.
+        self.cache_refreshed = False
 
-    def _get(self, path: str) -> Optional[Dict]:
-        """GET helper against the Sleeper API"""
+    @staticmethod
+    def _build_session() -> requests.Session:
+        """A session that retries transient failures instead of dying on them.
+
+        A draft poll runs every few seconds during a live draft; a single
+        502 from Sleeper should not take the whole run down.
+        """
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _get(self, path: str):
+        """GET a Sleeper endpoint, returning None when the resource is absent.
+
+        Sleeper answers unknown ids with ``200 OK`` and a literal ``null``
+        body rather than a 404, so an empty body has to be treated as
+        "not found" just like a real error status.
+        """
+        url = f"{self.base_url}{path}"
         try:
-            response = self.session.get(f"{self.base_url}{path}")
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Error fetching {path}: {e}")
-            return None
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        except requests.RequestException as exc:
+            raise SleeperError(f"Request to {url} failed: {exc}") from exc
 
-    def fetch_league(self) -> Dict:
-        """Fetch league metadata, including the current draft_id"""
-        return self._get(f"/league/{self.league_id}") or {}
+        if response.status_code == 404:
+            return None
+        if not response.ok:
+            raise SleeperError(f"{url} returned HTTP {response.status_code}")
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise SleeperError(f"{url} returned a non-JSON body") from exc
+
+    # ------------------------------------------------------------------
+    # Fetching
+    # ------------------------------------------------------------------
+
+    def resolve_draft_id(self) -> str:
+        """Find the draft to watch, preferring an explicitly configured one."""
+        if self.draft_id:
+            return self.draft_id
+
+        league = self._get(f"/league/{self.league_id}")
+        if not league:
+            raise SleeperError(
+                f"No Sleeper league with id '{self.league_id}'. "
+                "Check SLEEPER_LEAGUE_ID - the league id is the number in the "
+                "league URL, and is not the same as your user id."
+            )
+
+        draft_id = league.get("draft_id")
+        if not draft_id:
+            raise SleeperError(
+                f"League '{league.get('name', self.league_id)}' has no draft yet"
+            )
+
+        self.draft_id = draft_id
+        return draft_id
 
     def fetch_draft(self, draft_id: str) -> Dict:
-        """Fetch draft settings/status"""
-        return self._get(f"/draft/{draft_id}") or {}
+        draft = self._get(f"/draft/{draft_id}")
+        if not draft:
+            raise SleeperError(f"No Sleeper draft with id '{draft_id}'")
+        return draft
 
     def fetch_draft_picks(self, draft_id: str) -> List[Dict]:
-        """Fetch all picks made so far in the draft"""
         return self._get(f"/draft/{draft_id}/picks") or []
 
-    def fetch_all_players(self) -> Dict[str, Dict]:
+    def fetch_all_players(self, cache_path: str) -> Dict[str, Dict]:
+        """Return the fantasy-relevant player pool, keyed by player_id.
+
+        The upstream endpoint is ~14MB of every player Sleeper knows about,
+        so the response is pruned to the fields and positions this tool
+        actually uses before being cached to disk.
         """
-        Fetch the full NFL player pool, keyed by player_id.
+        cached = self._read_players_cache(cache_path)
+        if cached is not None:
+            _log(f"Using cached player pool ({len(cached)} players)")
+            return cached
 
-        Sleeper asks that this (large, ~5MB) endpoint not be hit more than
-        once per day, so results are cached to disk between runs.
-        """
-        if os.path.exists(PLAYERS_CACHE_PATH):
-            age = time.time() - os.path.getmtime(PLAYERS_CACHE_PATH)
-            if age < PLAYERS_CACHE_MAX_AGE_SECONDS:
-                with open(PLAYERS_CACHE_PATH, "r") as f:
-                    return json.load(f)
+        self.cache_refreshed = True
 
-        players = self._get("/players/nfl") or {}
-        if players:
-            with open(PLAYERS_CACHE_PATH, "w") as f:
-                json.dump(players, f)
+        _log("Fetching player pool from Sleeper (this endpoint is large)...")
+        raw = self._get("/players/nfl")
+        if not raw:
+            raise SleeperError("Sleeper returned an empty player pool")
 
+        players = self._prune_players(raw)
+        self._write_players_cache(cache_path, players)
+        _log(f"Fetched {len(players)} fantasy-relevant players")
         return players
 
-    def get_drafted_player_ids(self, picks: List[Dict]) -> set:
-        """Extract the set of already-drafted Sleeper player_ids"""
-        return {pick.get("player_id") for pick in picks if pick.get("player_id")}
-
-    def get_available_players(self, all_players: Dict[str, Dict], drafted: set) -> List[Dict]:
-        """Get list of available (undrafted) players"""
-        available = []
-
-        for player_id, player in all_players.items():
-            if player_id in drafted:
+    @staticmethod
+    def _prune_players(raw: Dict[str, Dict]) -> Dict[str, Dict]:
+        """Keep only fantasy-relevant players and the fields we score on."""
+        pruned = {}
+        for player_id, player in raw.items():
+            if not isinstance(player, dict):
                 continue
 
-            # Skip players Sleeper has no fantasy relevance for
-            if not player.get("fantasy_positions"):
+            positions = set(player.get("fantasy_positions") or ())
+            if not positions & FANTASY_POSITIONS:
                 continue
 
-            full_name = player.get("full_name") or f"{player.get('first_name', '')} {player.get('last_name', '')}".strip()
+            full_name = player.get("full_name") or " ".join(
+                part for part in (player.get("first_name"), player.get("last_name")) if part
+            ).strip()
 
-            available.append({
+            pruned[player_id] = {
                 "id": player_id,
-                "name": full_name,
-                "position": player.get("position", ""),
+                "name": full_name or player_id,
+                "position": player.get("position") or "",
                 "nfl_team": player.get("team") or "FA",
                 "search_rank": player.get("search_rank"),
-            })
+                "status": player.get("status"),
+                "active": player.get("active"),
+            }
+        return pruned
 
+    @staticmethod
+    def _read_players_cache(cache_path: str) -> Optional[Dict[str, Dict]]:
+        """Load the cached pool, ignoring anything stale, corrupt or foreign.
+
+        The age is stored inside the payload rather than read from the file
+        mtime so that copying or restoring the cache cannot silently make a
+        months-old pool look fresh.
+        """
+        if not cache_path or not os.path.exists(cache_path):
+            return None
+
+        try:
+            with open(cache_path, "r") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            _log("Player cache is unreadable or corrupt; refetching")
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != PLAYERS_CACHE_VERSION:
+            return None
+
+        fetched_at = payload.get("fetched_at")
+        if not isinstance(fetched_at, (int, float)):
+            return None
+        if time.time() - fetched_at > PLAYERS_CACHE_MAX_AGE_SECONDS:
+            return None
+
+        players = payload.get("players")
+        return players if isinstance(players, dict) and players else None
+
+    @staticmethod
+    def _write_players_cache(cache_path: str, players: Dict[str, Dict]) -> None:
+        """Cache the pool atomically so a crash can't leave a half-written file.
+
+        Caching is a nicety, not a requirement, so a read-only or full disk
+        is logged and otherwise ignored.
+        """
+        if not cache_path:
+            return
+
+        payload = {
+            "version": PLAYERS_CACHE_VERSION,
+            "fetched_at": time.time(),
+            "players": players,
+        }
+        directory = os.path.dirname(os.path.abspath(cache_path))
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", dir=directory, delete=False, suffix=".tmp"
+            ) as handle:
+                json.dump(payload, handle)
+                temp_path = handle.name
+            os.replace(temp_path, cache_path)
+        except OSError as exc:
+            _log(f"Could not write player cache to {cache_path}: {exc}")
+
+    # ------------------------------------------------------------------
+    # Ranking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_overall_ranks(players: Dict[str, Dict]) -> Dict[str, int]:
+        """Turn Sleeper's search_rank into a dense 1..N ordering.
+
+        ``search_rank`` cannot be compared to a pick number directly: it is a
+        search-popularity rank, it is heavily tied (a single rank can be
+        shared by 100+ players), and it leaves gaps. Sorting the pool and
+        taking each player's ordinal position yields a rank on the same
+        scale as "overall pick number", which is what the value score needs.
+
+        Ties are broken by name so that the ordering is stable between runs
+        rather than depending on dict iteration order.
+        """
+        ranked = []
+        for player_id, player in players.items():
+            rank = player.get("search_rank")
+            if isinstance(rank, bool) or not isinstance(rank, (int, float)):
+                continue
+            if rank >= UNRANKED_SENTINEL:
+                continue
+            ranked.append((rank, player.get("name") or "", player_id))
+
+        ranked.sort()
+        return {player_id: i + 1 for i, (_, _, player_id) in enumerate(ranked)}
+
+    @staticmethod
+    def get_drafted_player_ids(picks: Iterable[Dict]) -> Set[str]:
+        """Sleeper player_ids already taken.
+
+        Picks that are on the board but not yet filled carry a null
+        ``player_id`` and are skipped.
+        """
+        return {pick.get("player_id") for pick in picks if pick.get("player_id")}
+
+    def get_available_players(
+        self,
+        players: Dict[str, Dict],
+        drafted: Set[str],
+        overall_ranks: Dict[str, int],
+        exclude_positions: Set[str],
+    ) -> List[Dict]:
+        """Undrafted, rankable players, best first.
+
+        Unranked players are dropped rather than pushed to the back: without
+        a rank there is no value to estimate, and Sleeper marks thousands of
+        deep-roster players this way.
+        """
+        available = []
+        for player_id, player in players.items():
+            if player_id in drafted:
+                continue
+            if player_id not in overall_ranks:
+                continue
+            if player.get("position") in exclude_positions:
+                continue
+            available.append({**player, "overall_rank": overall_ranks[player_id]})
+
+        available.sort(key=lambda p: p["overall_rank"])
         return available
 
-    def get_draft_clock(self, draft: Dict, picks: List[Dict]) -> Dict:
-        """Get current draft status (pick number, picks remaining, etc)"""
-        settings = draft.get("settings", {})
-        total_picks = settings.get("rounds", 0) * settings.get("teams", 0)
+    @staticmethod
+    def score_player_value(player: Dict, current_pick: int) -> float:
+        """How many picks past their expected slot a player has fallen.
+
+        Positive means the player is still on the board later than their rank
+        says they should be, i.e. value. Negative means taking them now would
+        be a reach. The score is deliberately not clamped at zero: clamping
+        made every player score 0.0 at the top of the draft, which left the
+        recommendations indistinguishable and no alert could ever fire.
+        """
+        return float(current_pick - player["overall_rank"])
+
+    def get_recommendations(
+        self, available: List[Dict], current_pick: int, top_n: int
+    ) -> List[Dict]:
+        """Top-N available players by value score.
+
+        ``available`` is already sorted by rank and the score is a strictly
+        decreasing function of rank at a fixed pick number, so the best
+        values are simply the best-ranked players still on the board.
+        """
+        scored = [
+            {**player, "value_score": self.score_player_value(player, current_pick)}
+            for player in available[: max(top_n, 0)]
+        ]
+        return scored
+
+    # ------------------------------------------------------------------
+    # Draft state
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_draft_clock(draft: Dict, picks: List[Dict]) -> Dict:
+        """Where the draft currently stands."""
+        settings = draft.get("settings") or {}
+        rounds = settings.get("rounds") or 0
+        teams = settings.get("teams") or 0
+        total_picks = rounds * teams
+
         picks_made = len(picks)
+        # Once the board is full the "next" pick would run off the end of the
+        # draft, so report the final pick rather than an impossible one.
+        current_pick = picks_made + 1
+        if total_picks:
+            current_pick = min(current_pick, total_picks)
+        current_round = (((current_pick - 1) // teams) + 1) if teams else 0
 
         return {
             "status": draft.get("status", "unknown"),
-            "current_pick": picks_made + 1,
-            "picks_remaining": max(0, total_picks - picks_made),
+            "type": draft.get("type", "unknown"),
+            "rounds": rounds,
+            "teams": teams,
+            "total_picks": total_picks,
+            "picks_made": picks_made,
+            "picks_remaining": max(0, total_picks - picks_made) if total_picks else 0,
+            "current_pick": current_pick,
+            "current_round": current_round,
         }
 
-    def get_effective_adp(self, player: Dict) -> float:
+    def get_on_the_clock(self, draft: Dict, clock: Dict) -> Dict:
+        """Which draft slot is picking, and whether it is yours.
+
+        Snake drafts reverse the slot order on even rounds, so the slot on
+        the clock is not simply the position within the round.
         """
-        Normalize a player's search_rank into a usable ADP number.
+        teams = clock["teams"]
+        result = {"slot": None, "roster_id": None, "is_my_pick": None}
+        if not teams or clock["status"] != "drafting":
+            return result
 
-        Sleeper uses 9999999 as a sentinel "unranked" value for players
-        with no meaningful ADP (free agents, practice squad, etc), and
-        omits search_rank entirely for others. Both cases are treated the
-        same: pushed to the back of the pool instead of trusted at face
-        value.
-        """
-        UNRANKED_SENTINEL = 9999999
-        FALLBACK_ADP = 9999.0
+        index_in_round = (clock["current_pick"] - 1) % teams
+        slot = index_in_round + 1
+        if draft.get("type") == "snake" and clock["current_round"] % 2 == 0:
+            slot = teams - index_in_round
 
-        player_adp = player.get("search_rank")
-        try:
-            player_adp = float(player_adp)
-            if player_adp >= UNRANKED_SENTINEL:
-                player_adp = FALLBACK_ADP
-        except (TypeError, ValueError):
-            player_adp = FALLBACK_ADP
+        result["slot"] = slot
 
-        return player_adp
+        slot_to_roster = draft.get("slot_to_roster_id") or {}
+        result["roster_id"] = slot_to_roster.get(str(slot), slot_to_roster.get(slot))
 
-    def score_player_value(self, player: Dict, drafted_count: int) -> float:
-        """
-        Simple value scoring: how much better is this player than what's expected?
+        if self.user_id:
+            draft_order = draft.get("draft_order") or {}
+            my_slot = draft_order.get(self.user_id)
+            result["is_my_pick"] = (my_slot == slot) if my_slot is not None else False
 
-        Uses Sleeper's search_rank (an overall ADP-style ranking) as the
-        player's expected draft position.
+        return result
 
-        Args:
-            player: Player dict with position, name, search_rank, etc
-            drafted_count: How many players have been drafted so far
-
-        Returns:
-            Value score (higher = better value)
-        """
-        expected_adp = drafted_count + 1
-        player_adp = self.get_effective_adp(player)
-
-        # search_rank is an ADP-style rank where lower = better player.
-        # Value = how far past their expected draft slot they've fallen,
-        # i.e. how much better-ranked they are than the current pick count.
-        return max(0.0, expected_adp - player_adp)
-
-    def get_recommendations(self, available: List[Dict], drafted_count: int, top_n: int = 5) -> List[Dict]:
-        """
-        Get top value recommendations from available players
-
-        Args:
-            available: List of available players
-            drafted_count: Players drafted so far
-            top_n: How many recommendations to return
-
-        Returns:
-            Ranked list of recommended players
-        """
-        scored = []
-
-        for player in available:
-            score = self.score_player_value(player, drafted_count)
-            scored.append({**player, "value_score": score})
-
-        # Sort by value score (descending), breaking ties by ADP (ascending,
-        # best player first) instead of leaving equally-scored players in
-        # whatever arbitrary order Sleeper's API returned them in.
-        scored.sort(key=lambda x: (-x["value_score"], self.get_effective_adp(x)))
-
-        return scored[:top_n]
-
-    def should_alert(self, value_score: float, threshold: float = 10.0) -> bool:
-        """Determine if we should alert for this pick (high value threshold)"""
+    @staticmethod
+    def should_alert(value_score: float, threshold: float) -> bool:
+        """Whether a player has fallen far enough past their rank to flag."""
         return value_score > threshold
 
-    def format_recommendation(self, player: Dict) -> str:
-        """Format a player recommendation for display"""
-        return (
-            f"🎯 RECOMMENDATION: {player['name']} ({player['position']}) - "
-            f"Value Score: {player['value_score']:.1f}"
-        )
 
-    def format_alert(self, player: Dict) -> str:
-        """Format a high-value alert"""
-        return (
-            f"🚨 ALERT! Exceptional value: {player['name']} ({player['position']}) "
-            f"still available! Value: {player['value_score']:.1f}"
-        )
+# ----------------------------------------------------------------------
+# Orchestration
+# ----------------------------------------------------------------------
 
 
-def run_analysis(league_id: str) -> Dict:
-    """
-    Main analysis function - run this each polling cycle
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _log(f"{name}='{raw}' is not a number; using {default}")
+        return default
 
-    Args:
-        league_id: Sleeper league ID
-    """
-    analyzer = SleeperFantasyAnalyzer(league_id)
 
-    league = analyzer.fetch_league()
-    if not league:
-        return {"error": "Could not fetch league data"}
+def _env_int(name: str, default: int) -> int:
+    return int(_env_float(name, float(default)))
 
-    draft_id = league.get("draft_id")
-    if not draft_id:
-        return {"error": "League has no associated draft_id"}
 
-    draft = analyzer.fetch_draft(draft_id)
-    picks = analyzer.fetch_draft_picks(draft_id)
-    all_players = analyzer.fetch_all_players()
+def run_analysis() -> Dict:
+    """Run one polling cycle and return the analysis payload."""
+    league_id = os.getenv("SLEEPER_LEAGUE_ID", "").strip()
+    draft_id = os.getenv("SLEEPER_DRAFT_ID", "").strip()
+    user_id = os.getenv("SLEEPER_USER_ID", "").strip()
+    base_url = os.getenv("SLEEPER_BASE_URL", "").strip() or DEFAULT_BASE_URL
+    cache_path = os.getenv("PLAYERS_CACHE_PATH", "sleeper_players_cache.json").strip()
 
-    # Get drafted and available players
-    drafted = analyzer.get_drafted_player_ids(picks)
-    available = analyzer.get_available_players(all_players, drafted)
-
-    # Get draft status
-    status = analyzer.get_draft_clock(draft, picks)
-
-    # Get recommendations
-    recommendations = analyzer.get_recommendations(available, len(drafted))
-
-    # Check for high-value alerts
-    alerts = [r for r in recommendations if analyzer.should_alert(r["value_score"])]
-
-    # Format output
-    result = {
-        "timestamp": datetime.now().isoformat(),
-        "draft_status": {
-            "status": status["status"],
-            "picks_made": len(drafted),
-            "picks_remaining": status["picks_remaining"],
-            "current_pick": status["current_pick"],
-        },
-        "recommendations": [
-            {
-                "rank": i + 1,
-                "name": r["name"],
-                "position": r["position"],
-                "nfl_team": r["nfl_team"],
-                "value_score": round(r["value_score"], 2),
-                "alert": analyzer.should_alert(r["value_score"])
-            }
-            for i, r in enumerate(recommendations[:5])
-        ],
-        "high_value_alerts": len(alerts),
+    threshold = _env_float("ALERT_THRESHOLD", 10.0)
+    top_n = _env_int("TOP_N", 5)
+    exclude_positions = {
+        part.strip().upper()
+        for part in os.getenv("EXCLUDE_POSITIONS", "").split(",")
+        if part.strip()
     }
 
-    return result
+    analyzer = SleeperFantasyAnalyzer(
+        league_id=league_id or None,
+        draft_id=draft_id or None,
+        base_url=base_url,
+        user_id=user_id or None,
+    )
+
+    resolved_draft_id = analyzer.resolve_draft_id()
+    draft = analyzer.fetch_draft(resolved_draft_id)
+    picks = analyzer.fetch_draft_picks(resolved_draft_id)
+    players = analyzer.fetch_all_players(cache_path)
+
+    overall_ranks = analyzer.build_overall_ranks(players)
+    drafted = analyzer.get_drafted_player_ids(picks)
+    clock = analyzer.get_draft_clock(draft, picks)
+    on_the_clock = analyzer.get_on_the_clock(draft, clock)
+
+    available = analyzer.get_available_players(
+        players, drafted, overall_ranks, exclude_positions
+    )
+    recommendations = analyzer.get_recommendations(
+        available, clock["current_pick"], top_n
+    )
+
+    formatted = [
+        {
+            "rank": i + 1,
+            "player_id": player["id"],
+            "name": player["name"],
+            "position": player["position"],
+            "nfl_team": player["nfl_team"],
+            "overall_rank": player["overall_rank"],
+            "value_score": round(player["value_score"], 2),
+            "alert": analyzer.should_alert(player["value_score"], threshold),
+        }
+        for i, player in enumerate(recommendations)
+    ]
+    alerts = [rec for rec in formatted if rec["alert"]]
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "league_id": league_id or None,
+        "draft_id": resolved_draft_id,
+        "draft_status": {
+            "status": clock["status"],
+            "type": clock["type"],
+            "rounds": clock["rounds"],
+            "teams": clock["teams"],
+            "picks_made": clock["picks_made"],
+            "picks_remaining": clock["picks_remaining"],
+            "total_picks": clock["total_picks"],
+            "current_pick": clock["current_pick"],
+            "current_round": clock["current_round"],
+        },
+        "on_the_clock": on_the_clock,
+        "players_available": len(available),
+        "alert_threshold": threshold,
+        "recommendations": formatted,
+        "high_value_alerts": len(alerts),
+        "is_drafting": clock["status"] == "drafting",
+        "cache_refreshed": analyzer.cache_refreshed,
+        "error": None,
+    }
+
+
+def _summarize(result: Dict) -> str:
+    """A short operator-facing summary.
+
+    The full payload already goes to OUTPUT_FILE and to Kestra outputs, so
+    dumping it into the log as well just buries the useful lines - a poll
+    running every 30 seconds needs to stay readable.
+    """
+    if result.get("error"):
+        return f"Analysis failed: {result['error']}"
+
+    status = result["draft_status"]
+    clock = result.get("on_the_clock") or {}
+    lines = [
+        f"Draft {result['draft_id']} is {status['status']} - "
+        f"round {status['current_round']}, pick {status['current_pick']} "
+        f"of {status['total_picks']}"
+    ]
+    if clock.get("slot"):
+        mine = " (your pick)" if clock.get("is_my_pick") else ""
+        lines.append(f"On the clock: slot {clock['slot']}{mine}")
+    lines.append(
+        f"{result['players_available']} players available, "
+        f"{result['high_value_alerts']} above the alert threshold"
+    )
+    for rec in result["recommendations"]:
+        flag = " <-- ALERT" if rec["alert"] else ""
+        lines.append(
+            f"  {rec['rank']}. {rec['name']} ({rec['position']}/{rec['nfl_team']}) "
+            f"rank #{rec['overall_rank']} value {rec['value_score']:+}{flag}"
+        )
+    return "\n".join(lines)
+
+
+def main() -> int:
+    output_file = os.getenv("OUTPUT_FILE", "draft_analysis.json").strip()
+
+    try:
+        result = run_analysis()
+        exit_code = 0
+    except SleeperError as exc:
+        _log(f"ERROR: {exc}")
+        result = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "draft_status": {"status": "error"},
+            "recommendations": [],
+            "high_value_alerts": 0,
+            "is_drafting": False,
+            "cache_refreshed": False,
+            "error": str(exc),
+        }
+        exit_code = 1
+
+    # Always write the file: the flow declares it as an output, and a failed
+    # run should still leave a readable record of why.
+    if output_file:
+        with open(output_file, "w") as handle:
+            json.dump(result, handle, indent=2)
+
+    emit_kestra({"outputs": {"analysis": result}})
+    if not result.get("error"):
+        emit_kestra(
+            {
+                "metrics": [
+                    {
+                        "name": "picks_made",
+                        "type": "counter",
+                        "value": result["draft_status"]["picks_made"],
+                    },
+                    {
+                        "name": "high_value_alerts",
+                        "type": "counter",
+                        "value": result["high_value_alerts"],
+                    },
+                ]
+            }
+        )
+
+    _log(_summarize(result))
+    return exit_code
 
 
 if __name__ == "__main__":
-    # For testing: replace with your league ID
-    league_id = os.getenv("SLEEPER_LEAGUE_ID", "YOUR_LEAGUE_ID_HERE")
-
-    if league_id == "YOUR_LEAGUE_ID_HERE":
-        print("ERROR: Set SLEEPER_LEAGUE_ID environment variable")
-        exit(1)
-
-    results = run_analysis(league_id)
-    print(json.dumps(results, indent=2))
+    sys.exit(main())

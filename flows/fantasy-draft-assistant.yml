@@ -1,88 +1,196 @@
 id: fantasy-draft-assistant
 namespace: test.robs-test
+
 description: |
   Fantasy Football Draft Decision Assistant
 
-  This workflow monitors your Sleeper fantasy football draft in real-time
-  and provides recommendations for available players based on value scoring.
+  Polls a live Sleeper draft and logs the best-value players still on the
+  board, raising an alert when someone falls well past their ranking.
 
-  Configuration:
-  1. Set SLEEPER_LEAGUE_ID environment variable to your league ID
-  2. Adjust polling frequency in the cron expression (currently every 30 seconds)
-  3. Monitor logs during your draft for alerts and recommendations
-  '
+  Setup:
+    1. Upload `fantasy_football_analyzer.py` as a Namespace File in this
+       namespace (the `analyze_draft` task loads it from there).
+    2. Set `league_id` to the number in your Sleeper league URL
+       (https://sleeper.com/leagues/<league_id>/...). It is NOT your user id.
+       For a mock draft, leave it blank and set `draft_id` instead.
+    3. Set `user_id` to have the flow tell you when you are on the clock.
+    4. Enable the `poll_during_draft` trigger while the draft is running.
 
-variables:
-  SLEEPER_LEAGUE_ID: "926225845410648064"  # Set this via environment or UI
+  A player's value score is how many picks past their expected slot they
+  are still available. Positive is value, negative is a reach.
 
-# Trigger: Manual for MVP, or use schedule if you want to run during specific windows
+labels:
+  owner: rob
+  domain: fantasy-football
+
+inputs:
+  - id: league_id
+    type: STRING
+    required: true
+    defaults: ""
+    description: Sleeper league id, from the league URL. Leave blank if using draft_id.
+
+  - id: draft_id
+    type: STRING
+    required: true
+    defaults: ""
+    description: Watch a draft directly, bypassing the league lookup. Useful for mock drafts.
+
+  - id: user_id
+    type: STRING
+    required: true
+    defaults: ""
+    description: Your Sleeper user id, so the flow can tell you when it is your pick.
+
+  - id: alert_threshold
+    type: FLOAT
+    required: true
+    defaults: 10.0
+    description: Flag a player once they have fallen this many picks past their rank.
+
+  - id: top_n
+    type: INT
+    required: true
+    defaults: 5
+    description: How many recommendations to report each poll.
+
+  - id: exclude_positions
+    type: STRING
+    required: true
+    defaults: "K,DEF"
+    description: >
+      Positions to leave out of recommendations. Kickers and defenses carry a
+      misleadingly strong Sleeper search rank for how late they are actually
+      drafted, so they are excluded by default.
+
+  - id: sleeper_base_url
+    type: STRING
+    required: true
+    defaults: "https://api.sleeper.app/v1"
+    description: Sleeper API root. Override only to point at a test fixture.
+
 tasks:
-  - id: check-league-status
+  - id: analyze_draft
     type: io.kestra.plugin.scripts.python.Commands
-    runner: PROCESS
-    containerImage: python:3.11
+    description: Pull the live draft from Sleeper and score the remaining players.
+    namespaceFiles:
+      enabled: true
+      include:
+        - fantasy_football_analyzer.py
+        # Injected only once it exists; the first run builds it.
+        - sleeper_players_cache.json
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.13-slim
     beforeCommands:
-      - pip install requests pandas pytz aiohttp
-    commands:
-      - python ./fantasy_football_analyzer.py
+      - pip install --quiet --no-cache-dir requests
     env:
-      SLEEPER_LEAGUE_ID: "{{ env.SLEEPER_LEAGUE_ID }}"
+      SLEEPER_LEAGUE_ID: "{{ inputs.league_id }}"
+      SLEEPER_DRAFT_ID: "{{ inputs.draft_id }}"
+      SLEEPER_USER_ID: "{{ inputs.user_id }}"
+      SLEEPER_BASE_URL: "{{ inputs.sleeper_base_url }}"
+      ALERT_THRESHOLD: "{{ inputs.alert_threshold }}"
+      TOP_N: "{{ inputs.top_n }}"
+      EXCLUDE_POSITIONS: "{{ inputs.exclude_positions }}"
+      OUTPUT_FILE: draft_analysis.json
+    commands:
+      - python fantasy_football_analyzer.py
     outputFiles:
       - draft_analysis.json
-    
-  - id: parse-analysis
-    type: io.kestra.plugin.core.http.Request
-    method: GET
-    url: "draft_analysis.json"
-    
-  - id: check-for-alerts
+      - sleeper_players_cache.json
+
+  - id: persist_player_cache
     type: io.kestra.plugin.core.flow.If
-    condition: "{{ outputs.parse-analysis.body.high_value_alerts > 0 }}"
+    description: >
+      Sleeper's player endpoint is ~14MB and they ask that it be called at most
+      once a day. Each task run gets a clean working directory, so the pruned
+      pool is stored as a namespace file and re-injected on later runs -
+      otherwise a 30-second poll would refetch it every single time.
+    condition: "{{ outputs.analyze_draft.vars.analysis.cache_refreshed }}"
     then:
-      - id: alert-user
+      - id: upload_player_cache
+        type: io.kestra.plugin.core.namespace.UploadFiles
+        namespace: "{{ flow.namespace }}"
+        conflict: OVERWRITE
+        filesMap:
+          sleeper_players_cache.json: "{{ outputs.analyze_draft.outputFiles['sleeper_players_cache.json'] }}"
+
+  - id: route_by_draft_status
+    type: io.kestra.plugin.core.flow.Switch
+    description: Only the live-draft branch is worth acting on.
+    value: "{{ outputs.analyze_draft.vars.analysis.draft_status.status }}"
+    cases:
+      drafting:
+        - id: check_for_alerts
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.analyze_draft.vars.analysis.high_value_alerts > 0 }}"
+          then:
+            - id: alert_user
+              type: io.kestra.plugin.core.log.Log
+              level: WARN
+              message: |
+                🚨 DRAFT ALERT! 🚨
+                {{ outputs.analyze_draft.vars.analysis.high_value_alerts }} high-value player(s) still on the board.
+
+                Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }}
+                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU, PICK NOW{% endif %}
+
+                Fallen furthest past their ranking:
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ranked #{{ item.overall_rank }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} (value +{{ item.value_score }})
+                {% endif %}{% endfor %}
+          else:
+            - id: status_update
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                Draft update — {{ outputs.analyze_draft.vars.analysis.timestamp }}
+                Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} ({{ outputs.analyze_draft.vars.analysis.draft_status.picks_remaining }} remaining)
+                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU{% endif %}
+                No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold }} picks past their rank.
+
+                Best available:
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — rank #{{ item.overall_rank }}, value {{ item.value_score }}
+                {% endfor %}
+
+      pre_draft:
+        - id: not_started
+          type: io.kestra.plugin.core.log.Log
+          message: |
+            Draft {{ outputs.analyze_draft.vars.analysis.draft_id }} has not started yet.
+            {{ outputs.analyze_draft.vars.analysis.draft_status.teams }} teams × {{ outputs.analyze_draft.vars.analysis.draft_status.rounds }} rounds = {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} picks.
+
+      complete:
+        - id: draft_finished
+          type: io.kestra.plugin.core.log.Log
+          message: |
+            Draft {{ outputs.analyze_draft.vars.analysis.draft_id }} is complete — {{ outputs.analyze_draft.vars.analysis.draft_status.picks_made }} picks made.
+            You can disable the `poll_during_draft` trigger now.
+
+    defaults:
+      - id: unexpected_status
         type: io.kestra.plugin.core.log.Log
-        message: |
-          🚨 DRAFT ALERT! 🚨
-          High-value picks available!
-          
-          Top Recommendations:
-          {% for item in outputs.parse-analysis.body.recommendations %}
-            {% if item.alert %}
-          ⭐ {{ item.rank }}. {{ item.name }} ({{ item.position }}) - Value: {{ item.value_score }}
-            {% endif %}
-          {% endfor %}
-          
-          Picks made: {{ outputs.parse-analysis.body.draft_status.picks_made }}
-          Remaining: {{ outputs.parse-analysis.body.draft_status.picks_remaining }}
-    else:
-      - id: status-update
-        type: io.kestra.plugin.core.log.Log
-        message: |
-          Draft Status Update - {{ outputs.parse-analysis.body.timestamp }}
-          Picks: {{ outputs.parse-analysis.body.draft_status.picks_made }} / {{ outputs.parse-analysis.body.draft_status.picks_made | plus: outputs.parse-analysis.body.draft_status.picks_remaining }}
-          
-          Top 5 Available:
-          {% for item in outputs.parse-analysis.body.recommendations %}
-          {{ item.rank }}. {{ item.name }} ({{ item.position }}) - Value: {{ item.value_score }}
-          {% endfor %}
-  
-  - id: save-history
-    type: io.kestra.plugin.core.flow.AllMatch
-    tasks:
-      - id: append-to-log
-        type: io.kestra.plugin.scripts.python.Commands
-        runner: PROCESS
-        commands:
-          - |
-            import json
-            from datetime import datetime
-            
-            # Read current analysis
-            with open('draft_analysis.json', 'r') as f:
-              data = json.load(f)
-            
-            # Append to history file
-            with open('draft_history.jsonl', 'a') as f:
-              f.write(json.dumps(data) + '\n')
-            
-            print("Analysis saved to history")
+        level: WARN
+        message: "Draft is in state '{{ outputs.analyze_draft.vars.analysis.draft_status.status }}' — nothing to recommend."
+
+  - id: save_snapshot
+    type: io.kestra.plugin.core.kv.Set
+    description: >
+      Keep the latest analysis in the KV store so a later run (or another flow)
+      can diff against it. Every run's full draft_analysis.json is also kept in
+      internal storage as the durable history.
+    key: last_draft_analysis
+    kvType: JSON
+    overwrite: true
+    ttl: P7D
+    value: "{{ outputs.analyze_draft.vars.analysis | toJson }}"
+
+triggers:
+  - id: poll_during_draft
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    description: Enable this while your draft is live. Polls every 30 seconds.
+    # Scheduled runs get the inputs' default values, so set a default for
+    # `league_id` above (or add an `inputs:` block here) before enabling this.
+    cron: "*/30 * * * * *"
+    withSeconds: true
+    # A slow Sleeper response should not stack up overlapping polls.
+    allowConcurrent: false

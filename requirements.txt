@@ -1,4 +1,3 @@
+# The analyzer only needs an HTTP client; urllib3 comes with requests and is
+# used for its retry policy.
 requests
-pandas
-pytz
-aiohttp
