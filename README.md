@@ -72,17 +72,44 @@ Re-deploying an existing flow uses `PUT $KESTRA/flows/$NS/fantasy-draft-assistan
 
 Set `league_id` to the number in your Sleeper league URL
 (`https://sleeper.com/leagues/<league_id>/...`). That is **not** the same as
-your user id. For a mock draft, leave `league_id` blank and set `draft_id`.
+your user id.
+
+Every id input also accepts the **full URL** you copied it from, so pasting the
+address bar works.
 
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `league_id` | – | Sleeper league to watch |
-| `draft_id` | – | Watch a draft directly, skipping the league lookup |
+| `draft_id` | – | Watch a draft directly — **how you follow a mock draft**; wins over `league_id` |
 | `user_id` | – | Your Sleeper user id, so the flow says when you are on the clock |
 | `alert_threshold` | `10.0` | Picks past rank before a player is flagged |
 | `top_n` | `5` | How many recommendations per poll |
 | `exclude_positions` | `K,DEF` | Positions to leave out |
 | `sleeper_base_url` | Sleeper API | Override only to point at a test fixture |
+
+### Mock drafts
+
+A mock draft belongs to no league, so there is no league id to find it by — set
+**`draft_id`** instead, from the mock's URL:
+
+```
+https://sleeper.com/draft/nfl/1272518225074081792
+                              └────── draft_id ──────┘
+```
+
+Paste either the id or the whole URL. `draft_id` takes precedence over
+`league_id` when both are set, so you can leave a league configured and
+temporarily point the flow at a mock. Everything else — scoring, alerts, the
+value threshold — behaves identically; the logs just say `Mock draft` and the
+analysis carries `draft_info.is_mock: true`.
+
+Two things differ in a mock, both handled:
+
+- There are no rosters, so `on_the_clock.roster_id` is `null`. The draft slot
+  is still reported.
+- A mock against bots may have no draft order, so `on_the_clock.is_my_pick`
+  can be `false` even on your turn. Set `user_id` if the mock has real
+  participants and Sleeper will report the order.
 
 To poll automatically during your draft, give `league_id` a default (or add an
 `inputs:` block to the trigger) and enable the `poll_during_draft` trigger. It
@@ -105,6 +132,10 @@ uv pip install -r requirements.txt
 export SLEEPER_LEAGUE_ID=your_league_id
 export SLEEPER_USER_ID=your_user_id     # optional
 python analyzer_scripts/fantasy_football_analyzer.py
+
+# ...or follow a mock draft, by id or by URL
+SLEEPER_DRAFT_ID=https://sleeper.com/draft/nfl/1272518225074081792 \
+  python analyzer_scripts/fantasy_football_analyzer.py
 ```
 
 The script writes `draft_analysis.json`, prints a readable summary, and emits

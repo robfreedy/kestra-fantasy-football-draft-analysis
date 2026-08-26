@@ -8,10 +8,14 @@ board, so an orchestrator (Kestra) can alert you when something good falls.
 Configuration is entirely via environment variables:
 
   SLEEPER_LEAGUE_ID   League to watch. Required unless SLEEPER_DRAFT_ID is set.
-  SLEEPER_DRAFT_ID    Watch a draft directly, skipping the league lookup.
-                      Useful for mock drafts, which have no league.
+  SLEEPER_DRAFT_ID    Watch a draft directly, skipping the league lookup. This
+                      is how you follow a mock draft: mocks belong to no
+                      league, so they are only reachable by their draft id.
+                      Takes precedence over SLEEPER_LEAGUE_ID.
   SLEEPER_USER_ID     Your Sleeper user id. When set, the analysis reports
                       whether the draft is currently on your clock.
+
+All three id settings also accept the Sleeper URL you copied them from.
   SLEEPER_BASE_URL    API root. Overridable for testing against a fixture.
   ALERT_THRESHOLD     Value score above which a player is flagged. Default 10.
   TOP_N               How many recommendations to return. Default 5.
@@ -25,6 +29,7 @@ script-output format so downstream tasks can branch on it.
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -65,6 +70,26 @@ def _log(message: str) -> None:
     never begins with ``::``.
     """
     print(message, flush=True)
+
+
+def coerce_sleeper_id(value: str) -> str:
+    """Accept either a bare Sleeper id or the URL it was copied out of.
+
+    People copy the address bar rather than digging the id out of it, and a
+    mock draft is only ever reachable by its URL
+    (https://sleeper.com/draft/nfl/<draft_id>), so a pasted link is the
+    common case rather than the exotic one. League URLs
+    (https://sleeper.com/leagues/<league_id>/team) work the same way.
+
+    Anything unrecognizable is handed back untouched so the caller can put
+    the original value in its error message.
+    """
+    value = (value or "").strip()
+    if not value or value.isdigit():
+        return value
+
+    match = re.search(r"\d{6,}", value)
+    return match.group(0) if match else value
 
 
 def emit_kestra(payload: Dict) -> None:
@@ -382,6 +407,25 @@ class SleeperFantasyAnalyzer:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def describe_draft(draft: Dict) -> Dict:
+        """Identify the draft being watched.
+
+        A mock draft belongs to no league, so Sleeper leaves ``league_id``
+        null on it - that absence is what distinguishes a mock from a real
+        league draft, since the two are otherwise the same shape.
+        """
+        metadata = draft.get("metadata") or {}
+        league_id = draft.get("league_id")
+        return {
+            "league_id": league_id,
+            "is_mock": league_id is None,
+            "name": metadata.get("name") or "",
+            "scoring_type": metadata.get("scoring_type") or "",
+            "season": draft.get("season") or "",
+            "sport": draft.get("sport") or "",
+        }
+
+    @staticmethod
     def get_draft_clock(draft: Dict, picks: List[Dict]) -> Dict:
         """Where the draft currently stands."""
         settings = draft.get("settings") or {}
@@ -465,9 +509,9 @@ def _env_int(name: str, default: int) -> int:
 
 def run_analysis() -> Dict:
     """Run one polling cycle and return the analysis payload."""
-    league_id = os.getenv("SLEEPER_LEAGUE_ID", "").strip()
-    draft_id = os.getenv("SLEEPER_DRAFT_ID", "").strip()
-    user_id = os.getenv("SLEEPER_USER_ID", "").strip()
+    league_id = coerce_sleeper_id(os.getenv("SLEEPER_LEAGUE_ID", ""))
+    draft_id = coerce_sleeper_id(os.getenv("SLEEPER_DRAFT_ID", ""))
+    user_id = coerce_sleeper_id(os.getenv("SLEEPER_USER_ID", ""))
     base_url = os.getenv("SLEEPER_BASE_URL", "").strip() or DEFAULT_BASE_URL
     cache_path = os.getenv("PLAYERS_CACHE_PATH", "sleeper_players_cache.json").strip()
 
@@ -491,6 +535,7 @@ def run_analysis() -> Dict:
     picks = analyzer.fetch_draft_picks(resolved_draft_id)
     players = analyzer.fetch_all_players(cache_path)
 
+    draft_info = analyzer.describe_draft(draft)
     overall_ranks = analyzer.build_overall_ranks(players)
     drafted = analyzer.get_drafted_player_ids(picks)
     clock = analyzer.get_draft_clock(draft, picks)
@@ -520,8 +565,9 @@ def run_analysis() -> Dict:
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "league_id": league_id or None,
+        "league_id": draft_info["league_id"],
         "draft_id": resolved_draft_id,
+        "draft_info": draft_info,
         "draft_status": {
             "status": clock["status"],
             "type": clock["type"],
@@ -556,8 +602,13 @@ def _summarize(result: Dict) -> str:
 
     status = result["draft_status"]
     clock = result.get("on_the_clock") or {}
+    info = result.get("draft_info") or {}
+
+    kind = "Mock draft" if info.get("is_mock") else "Draft"
+    label = f'"{info["name"]}" ({result["draft_id"]})' if info.get("name") else result["draft_id"]
+    scoring = f" {info['scoring_type']}" if info.get("scoring_type") else ""
     lines = [
-        f"Draft {result['draft_id']} is {status['status']} - "
+        f"{kind} {label}{scoring} is {status['status']} - "
         f"round {status['current_round']}, pick {status['current_pick']} "
         f"of {status['total_picks']}"
     ]
@@ -588,6 +639,7 @@ def main() -> int:
         result = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "draft_status": {"status": "error"},
+            "draft_info": {"is_mock": False, "name": "", "scoring_type": ""},
             "recommendations": [],
             "high_value_alerts": 0,
             "is_drafting": False,

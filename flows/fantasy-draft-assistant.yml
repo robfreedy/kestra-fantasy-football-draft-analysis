@@ -10,9 +10,12 @@ description: |
   Setup:
     1. Upload `fantasy_football_analyzer.py` as a Namespace File in this
        namespace (the `analyze_draft` task loads it from there).
-    2. Set `league_id` to the number in your Sleeper league URL
+    2. For a league draft, set `league_id` from your league URL
        (https://sleeper.com/leagues/<league_id>/...). It is NOT your user id.
-       For a mock draft, leave it blank and set `draft_id` instead.
+       For a MOCK draft, set `draft_id` instead, from the mock's URL
+       (https://sleeper.com/draft/nfl/<draft_id>) - a mock belongs to no
+       league, so there is no league id to look it up by.
+       Every id input also accepts the full URL you copied it from.
     3. Set `user_id` to have the flow tell you when you are on the clock.
     4. Enable the `poll_during_draft` trigger while the draft is running.
 
@@ -28,19 +31,27 @@ inputs:
     type: STRING
     required: true
     defaults: ""
-    description: Sleeper league id, from the league URL. Leave blank if using draft_id.
+    description: >
+      Sleeper league id, or the league URL to pull it from. Leave blank when
+      watching a mock draft via draft_id.
 
   - id: draft_id
     type: STRING
     required: true
     defaults: ""
-    description: Watch a draft directly, bypassing the league lookup. Useful for mock drafts.
+    description: >
+      Draft id, or the draft URL to pull it from
+      (https://sleeper.com/draft/nfl/<draft_id>). This is how you follow a
+      MOCK draft, which has no league to look it up by. Takes precedence over
+      league_id when both are set.
 
   - id: user_id
     type: STRING
     required: true
     defaults: ""
-    description: Your Sleeper user id, so the flow can tell you when it is your pick.
+    description: >
+      Your Sleeper user id (or your profile URL), so the flow can tell you when
+      it is your pick. Mock drafts against bots may not report a draft order.
 
   - id: alert_threshold
     type: FLOAT
@@ -130,6 +141,7 @@ tasks:
               level: WARN
               message: |
                 🚨 DRAFT ALERT! 🚨
+                {% if outputs.analyze_draft.vars.analysis.draft_info.is_mock %}Mock draft{% else %}Draft{% endif %} {{ outputs.analyze_draft.vars.analysis.draft_info.name }} ({{ outputs.analyze_draft.vars.analysis.draft_id }})
                 {{ outputs.analyze_draft.vars.analysis.high_value_alerts }} high-value player(s) still on the board.
 
                 Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }}
@@ -142,7 +154,7 @@ tasks:
             - id: status_update
               type: io.kestra.plugin.core.log.Log
               message: |
-                Draft update — {{ outputs.analyze_draft.vars.analysis.timestamp }}
+                {% if outputs.analyze_draft.vars.analysis.draft_info.is_mock %}Mock draft{% else %}Draft{% endif %} update: {{ outputs.analyze_draft.vars.analysis.draft_info.name }} ({{ outputs.analyze_draft.vars.analysis.draft_id }}) — {{ outputs.analyze_draft.vars.analysis.timestamp }}
                 Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} ({{ outputs.analyze_draft.vars.analysis.draft_status.picks_remaining }} remaining)
                 On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU{% endif %}
                 No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold }} picks past their rank.
