@@ -7,15 +7,15 @@ board, so an orchestrator (Kestra) can alert you when something good falls.
 
 Configuration is entirely via environment variables:
 
-  SLEEPER_LEAGUE_ID   League to watch. Required unless SLEEPER_DRAFT_ID is set.
-  SLEEPER_DRAFT_ID    Watch a draft directly, skipping the league lookup. This
-                      is how you follow a mock draft: mocks belong to no
-                      league, so they are only reachable by their draft id.
-                      Takes precedence over SLEEPER_LEAGUE_ID.
-  SLEEPER_USER_ID     Your Sleeper user id. When set, the analysis reports
-                      whether the draft is currently on your clock.
+  SLEEPER_LEAGUE_OR_DRAFT_ID
+                      Required. The draft or league to watch. Either kind of id
+                      works - which one you gave is detected automatically - so
+                      a mock draft (which has no league) is configured exactly
+                      like a league draft.
+  SLEEPER_USER_ID     Your Sleeper user id or username. When set, the analysis
+                      reports whether the draft is currently on your clock.
 
-All three id settings also accept the Sleeper URL you copied them from.
+Both id settings also accept the Sleeper URL you copied them from.
   SLEEPER_BASE_URL    API root. Overridable for testing against a fixture.
   ALERT_THRESHOLD     Value score above which a player is flagged. Default 10.
   TOP_N               How many recommendations to return. Default 5.
@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -100,23 +100,23 @@ def emit_kestra(payload: Dict) -> None:
 class SleeperFantasyAnalyzer:
     def __init__(
         self,
-        league_id: Optional[str] = None,
-        draft_id: Optional[str] = None,
+        identifier: str,
         base_url: str = DEFAULT_BASE_URL,
         user_id: Optional[str] = None,
     ):
         """
         Args:
-            league_id: Sleeper league id (visible in the league URL).
-            draft_id: Draft id, if watching a draft directly.
+            identifier: A Sleeper draft id or league id - either is accepted,
+                and which one it is gets worked out on the first request.
             base_url: API root, overridable for tests.
-            user_id: Your Sleeper user id, for on-the-clock detection.
+            user_id: Your Sleeper user id or username, for on-the-clock
+                detection.
         """
-        if not league_id and not draft_id:
-            raise SleeperError("Either a league id or a draft id is required")
+        if not identifier:
+            raise SleeperError("A Sleeper draft id or league id is required")
 
-        self.league_id = league_id
-        self.draft_id = draft_id
+        self.identifier = identifier
+        self.draft_id: Optional[str] = None
         self.user_id = user_id
         self.base_url = base_url.rstrip("/")
         self.session = self._build_session()
@@ -171,33 +171,73 @@ class SleeperFantasyAnalyzer:
     # Fetching
     # ------------------------------------------------------------------
 
-    def resolve_draft_id(self) -> str:
-        """Find the draft to watch, preferring an explicitly configured one."""
-        if self.draft_id:
-            return self.draft_id
+    def resolve_draft(self) -> Tuple[str, Dict]:
+        """Resolve the configured id to a draft, whichever kind it is.
 
-        league = self._get(f"/league/{self.league_id}")
+        Leagues and drafts have separate id spaces on Sleeper and a mock draft
+        has no league at all, so the only way to accept one id for both is to
+        try it as each. Drafts are probed first: a mock is reachable no other
+        way, and a league id does not resolve as a draft.
+
+        Returns the draft id and the draft object, so the caller does not pay
+        for a second request to fetch what was just looked up.
+        """
+        draft = self._get(f"/draft/{self.identifier}")
+        if draft:
+            self.draft_id = self.identifier
+            return self.identifier, draft
+
+        league = self._get(f"/league/{self.identifier}")
         if not league:
             raise SleeperError(
-                f"No Sleeper league with id '{self.league_id}'. "
-                "Check SLEEPER_LEAGUE_ID - the league id is the number in the "
-                "league URL, and is not the same as your user id."
+                f"'{self.identifier}' is not a Sleeper draft id or league id. "
+                "For a mock draft, use the id in "
+                "https://sleeper.com/draft/nfl/<draft_id>; for a league, the "
+                "number in https://sleeper.com/leagues/<league_id>/... . A "
+                "user id or username will not work here."
             )
 
         draft_id = league.get("draft_id")
         if not draft_id:
             raise SleeperError(
-                f"League '{league.get('name', self.league_id)}' has no draft yet"
+                f"League '{league.get('name') or self.identifier}' has no draft yet"
+            )
+
+        draft = self._get(f"/draft/{draft_id}")
+        if not draft:
+            raise SleeperError(
+                f"League '{league.get('name') or self.identifier}' points at "
+                f"draft '{draft_id}', which Sleeper cannot find"
             )
 
         self.draft_id = draft_id
-        return draft_id
+        return draft_id, draft
 
-    def fetch_draft(self, draft_id: str) -> Dict:
-        draft = self._get(f"/draft/{draft_id}")
-        if not draft:
-            raise SleeperError(f"No Sleeper draft with id '{draft_id}'")
-        return draft
+    def resolve_user_id(self) -> Optional[str]:
+        """Turn a Sleeper username into the numeric id draft_order is keyed by.
+
+        ``draft_order`` maps numeric user ids to draft slots, but people know
+        themselves by their username - so without this lookup, on-the-clock
+        detection would quietly never match and every pick would look like
+        someone else's.
+        """
+        if not self.user_id or self.user_id.isdigit():
+            return self.user_id
+
+        username = self.user_id.rstrip("/").rsplit("/", 1)[-1].lstrip("@")
+        user = self._get(f"/user/{username}")
+        resolved = (user or {}).get("user_id")
+        if not resolved:
+            _log(
+                f"Sleeper has no user '{username}', so the flow cannot tell "
+                "whose pick it is"
+            )
+            self.user_id = None
+            return None
+
+        _log(f"Resolved Sleeper user '{username}' to id {resolved}")
+        self.user_id = resolved
+        return resolved
 
     def fetch_draft_picks(self, draft_id: str) -> List[Dict]:
         return self._get(f"/draft/{draft_id}/picks") or []
@@ -509,8 +549,7 @@ def _env_int(name: str, default: int) -> int:
 
 def run_analysis() -> Dict:
     """Run one polling cycle and return the analysis payload."""
-    league_id = coerce_sleeper_id(os.getenv("SLEEPER_LEAGUE_ID", ""))
-    draft_id = coerce_sleeper_id(os.getenv("SLEEPER_DRAFT_ID", ""))
+    identifier = coerce_sleeper_id(os.getenv("SLEEPER_LEAGUE_OR_DRAFT_ID", ""))
     user_id = coerce_sleeper_id(os.getenv("SLEEPER_USER_ID", ""))
     base_url = os.getenv("SLEEPER_BASE_URL", "").strip() or DEFAULT_BASE_URL
     cache_path = os.getenv("PLAYERS_CACHE_PATH", "sleeper_players_cache.json").strip()
@@ -524,14 +563,13 @@ def run_analysis() -> Dict:
     }
 
     analyzer = SleeperFantasyAnalyzer(
-        league_id=league_id or None,
-        draft_id=draft_id or None,
+        identifier=identifier,
         base_url=base_url,
         user_id=user_id or None,
     )
 
-    resolved_draft_id = analyzer.resolve_draft_id()
-    draft = analyzer.fetch_draft(resolved_draft_id)
+    resolved_draft_id, draft = analyzer.resolve_draft()
+    analyzer.resolve_user_id()
     picks = analyzer.fetch_draft_picks(resolved_draft_id)
     players = analyzer.fetch_all_players(cache_path)
 

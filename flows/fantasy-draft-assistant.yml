@@ -10,13 +10,14 @@ description: |
   Setup:
     1. Upload `fantasy_football_analyzer.py` as a Namespace File in this
        namespace (the `analyze_draft` task loads it from there).
-    2. For a league draft, set `league_id` from your league URL
-       (https://sleeper.com/leagues/<league_id>/...). It is NOT your user id.
-       For a MOCK draft, set `draft_id` instead, from the mock's URL
-       (https://sleeper.com/draft/nfl/<draft_id>) - a mock belongs to no
-       league, so there is no league id to look it up by.
-       Every id input also accepts the full URL you copied it from.
+    2. Set `league_or_draft_id` to whichever id you have - a league id from
+       https://sleeper.com/leagues/<league_id>/... or a draft id from
+       https://sleeper.com/draft/nfl/<draft_id>. Which kind it is gets
+       detected automatically, so a MOCK draft (which belongs to no league,
+       and so has only a draft id) is configured exactly like a league draft.
+       It is NOT your user id. The full URL works in place of the id.
     3. Set `user_id` to have the flow tell you when you are on the clock.
+       Your username works as well as your numeric id.
     4. Enable the `poll_during_draft` trigger while the draft is running.
 
   A player's value score is how many picks past their expected slot they
@@ -27,31 +28,27 @@ labels:
   domain: fantasy-football
 
 inputs:
-  - id: league_id
+  - id: league_or_draft_id
     type: STRING
     required: true
-    defaults: ""
+    defaults: "1398327930542669824"
     description: >
-      Sleeper league id, or the league URL to pull it from. Leave blank when
-      watching a mock draft via draft_id.
-
-  - id: draft_id
-    type: STRING
-    required: true
-    defaults: ""
-    description: >
-      Draft id, or the draft URL to pull it from
-      (https://sleeper.com/draft/nfl/<draft_id>). This is how you follow a
-      MOCK draft, which has no league to look it up by. Takes precedence over
-      league_id when both are set.
+      The Sleeper league or draft to watch - either kind of id works, and which
+      one you gave is detected automatically. A league id is the number in
+      https://sleeper.com/leagues/<league_id>/... ; a draft id is the number in
+      https://sleeper.com/draft/nfl/<draft_id>. Use a draft id to follow a MOCK
+      draft, which has no league to look it up by. The full URL can be pasted
+      in place of the bare id. This is not your user id.
 
   - id: user_id
     type: STRING
     required: true
-    defaults: ""
+    defaults: "robfreedy"
     description: >
-      Your Sleeper user id (or your profile URL), so the flow can tell you when
-      it is your pick. Mock drafts against bots may not report a draft order.
+      Your Sleeper username or numeric user id, so the flow can tell you when it
+      is your pick. A username is looked up automatically, because the draft
+      order Sleeper returns is keyed by numeric id. Mock drafts against bots may
+      not report a draft order at all.
 
   - id: alert_threshold
     type: FLOAT
@@ -96,8 +93,7 @@ tasks:
     beforeCommands:
       - pip install --quiet --no-cache-dir requests
     env:
-      SLEEPER_LEAGUE_ID: "{{ inputs.league_id }}"
-      SLEEPER_DRAFT_ID: "{{ inputs.draft_id }}"
+      SLEEPER_LEAGUE_OR_DRAFT_ID: "{{ inputs.league_or_draft_id }}"
       SLEEPER_USER_ID: "{{ inputs.user_id }}"
       SLEEPER_BASE_URL: "{{ inputs.sleeper_base_url }}"
       ALERT_THRESHOLD: "{{ inputs.alert_threshold }}"
@@ -198,10 +194,10 @@ tasks:
 triggers:
   - id: poll_during_draft
     type: io.kestra.plugin.core.trigger.Schedule
-    disabled: true
+    disabled: false
     description: Enable this while your draft is live. Polls every 30 seconds.
-    # Scheduled runs get the inputs' default values, so set a default for
-    # `league_id` above (or add an `inputs:` block here) before enabling this.
+    # Scheduled runs get the inputs' default values, so `league_or_draft_id`
+    # above must have the right default before this is enabled.
     cron: "*/30 * * * * *"
     withSeconds: true
     # A slow Sleeper response should not stack up overlapping polls.

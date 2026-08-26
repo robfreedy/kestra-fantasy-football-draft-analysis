@@ -70,18 +70,23 @@ Re-deploying an existing flow uses `PUT $KESTRA/flows/$NS/fantasy-draft-assistan
 
 ## Running it
 
-Set `league_id` to the number in your Sleeper league URL
-(`https://sleeper.com/leagues/<league_id>/...`). That is **not** the same as
-your user id.
+Set `league_or_draft_id` to whichever id you have — a **league id** from
+`https://sleeper.com/leagues/<league_id>/...` or a **draft id** from
+`https://sleeper.com/draft/nfl/<draft_id>`. Which kind you gave is detected
+automatically, so there is nothing to switch when you move between a league and
+a mock. That id is **not** your user id.
 
-Every id input also accepts the **full URL** you copied it from, so pasting the
+Both id inputs also accept the **full URL** you copied them from, so pasting the
 address bar works.
+
+`user_id` takes your **username** as well as your numeric id — Sleeper keys the
+draft order by numeric id, so a username is looked up for you. Without that
+lookup, "you are on the clock" would silently never fire.
 
 | Input | Default | Purpose |
 | --- | --- | --- |
-| `league_id` | – | Sleeper league to watch |
-| `draft_id` | – | Watch a draft directly — **how you follow a mock draft**; wins over `league_id` |
-| `user_id` | – | Your Sleeper user id, so the flow says when you are on the clock |
+| `league_or_draft_id` | – | The league **or** draft to watch; the kind is auto-detected |
+| `user_id` | – | Your Sleeper username or user id, so the flow says when you are on the clock |
 | `alert_threshold` | `10.0` | Picks past rank before a player is flagged |
 | `top_n` | `5` | How many recommendations per poll |
 | `exclude_positions` | `K,DEF` | Positions to leave out |
@@ -89,31 +94,34 @@ address bar works.
 
 ### Mock drafts
 
-A mock draft belongs to no league, so there is no league id to find it by — set
-**`draft_id`** instead, from the mock's URL:
+A mock draft belongs to no league, so it has only a draft id. Put that in
+`league_or_draft_id`, from the mock's URL:
 
 ```
-https://sleeper.com/draft/nfl/1272518225074081792
-                              └────── draft_id ──────┘
+https://sleeper.com/draft/nfl/1398327930542669824
+                              └───── draft id ─────┘
 ```
 
-Paste either the id or the whole URL. `draft_id` takes precedence over
-`league_id` when both are set, so you can leave a league configured and
-temporarily point the flow at a mock. Everything else — scoring, alerts, the
-value threshold — behaves identically; the logs just say `Mock draft` and the
-analysis carries `draft_info.is_mock: true`.
+Paste either the id or the whole URL. Nothing else changes — the flow probes
+the id as a draft first and as a league second, so leagues and mocks use the
+same input. Scoring, alerts and the value threshold behave identically; the
+logs just say `Mock draft` and the analysis carries `draft_info.is_mock: true`.
 
 Two things differ in a mock, both handled:
 
 - There are no rosters, so `on_the_clock.roster_id` is `null`. The draft slot
   is still reported.
 - A mock against bots may have no draft order, so `on_the_clock.is_my_pick`
-  can be `false` even on your turn. Set `user_id` if the mock has real
-  participants and Sleeper will report the order.
+  can be `false` even on your turn. When the mock has real participants,
+  Sleeper reports the order and `user_id` is matched against it.
 
-To poll automatically during your draft, give `league_id` a default (or add an
-`inputs:` block to the trigger) and enable the `poll_during_draft` trigger. It
-runs every 30 seconds and will not overlap runs.
+Note that `on_the_clock` is only populated once the draft status is `drafting`;
+a `pre_draft` mock reports `null` for the slot, which is why a mock you have not
+started yet logs "has not started yet" rather than a clock.
+
+To poll automatically during your draft, make sure `league_or_draft_id` has the
+right default — scheduled runs use the inputs' defaults — then enable the
+`poll_during_draft` trigger. It runs every 30 seconds and will not overlap runs.
 
 ### The player pool cache
 
@@ -129,12 +137,12 @@ refreshed, so a 30-second poll costs two small draft API calls.
 ```bash
 uv pip install -r requirements.txt
 
-export SLEEPER_LEAGUE_ID=your_league_id
-export SLEEPER_USER_ID=your_user_id     # optional
+export SLEEPER_LEAGUE_OR_DRAFT_ID=your_league_or_draft_id
+export SLEEPER_USER_ID=your_username    # optional
 python analyzer_scripts/fantasy_football_analyzer.py
 
-# ...or follow a mock draft, by id or by URL
-SLEEPER_DRAFT_ID=https://sleeper.com/draft/nfl/1272518225074081792 \
+# A mock draft is the same call - id or full URL, either works
+SLEEPER_LEAGUE_OR_DRAFT_ID=https://sleeper.com/draft/nfl/1398327930542669824 \
   python analyzer_scripts/fantasy_football_analyzer.py
 ```
 
