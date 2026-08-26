@@ -18,12 +18,48 @@ value_score = current_overall_pick - player_overall_rank
 A player ranked #4 who is somehow still there at pick #31 scores `+27` — that is
 a steal. A negative score means taking them now would be a reach.
 
+### Your roster is taken into account
+
+A raw value score will happily tell you to draft a second quarterback. So each
+candidate is also classified against the roster you have already drafted, using
+the league's own `slots_*` settings, and discounted if it does not fill a need:
+
+| Classification | Meaning | Default discount |
+| --- | --- | --- |
+| `starter` | A starting slot at that position is still empty | none |
+| `flex` | Dedicated slots are full, but a flex slot can take them | 8 picks |
+| `depth` | Starting and flex slots are full — this is a bench pick | 20 picks, ×2 for the next one, ×3 after that |
+
+```
+1. Jeremiyah Love  (RB) rank #21  value +30            => +30  <-- ALERT
+2. Drake Maye      (QB) rank #12  value +39 -20 depth  => +19
+3. George Pickens  (WR) rank #33  value +18 -8 flex    => +10
+```
+
+Maye had the best raw value on the board, but with a quarterback already
+rostered he drops behind a running back you actually need. He is still *listed*,
+with the arithmetic shown, because a player who has fallen 39 picks past his
+rank is worth knowing about — raise `depth_penalty` to bury backups harder, or
+set both penalties to `0` to rank purely on value.
+
+Alerts fire on the adjusted score, so a position you have already filled cannot
+raise one on raw value alone. Your picks are attributed by `draft_slot` rather
+than `picked_by`, because `picked_by` is blank on autopicks and would silently
+leave players off your roster.
+
 Rankings come from Sleeper's `search_rank`. A caveat worth knowing: **that field
 is a search-popularity rank, not a true ADP.** It is heavily tied (one rank can
 be shared by 100+ players) and it rates kickers and defenses far more highly
 than they are actually drafted. The analyzer normalizes it into a dense 1..N
 ordering so it is at least on the same scale as a pick number, and excludes
-`K` and `DEF` by default. If you want real ADP, plug a different ranking source
+`K` and `DEF` by default — Sleeper gives **no** team defence a search rank at
+all, so DEF could never be recommended regardless.
+
+Players with no NFL team are also dropped, since they cannot score. Sleeper's
+`status` and `active` flags are not reliable for this: Todd Gurley, retired
+since 2021, is still listed as `Active` with a search rank of 27. Having no team
+is the signal that actually works, and in the top 80 ranked players it removes
+exactly two, both noise. Set `REQUIRE_NFL_TEAM=false` to keep free agents. If you want real ADP, plug a different ranking source
 into `build_overall_ranks()`.
 
 ## Layout
@@ -90,6 +126,8 @@ lookup, "you are on the clock" would silently never fire.
 | `alert_threshold` | `10.0` | Picks past rank before a player is flagged |
 | `top_n` | `5` | How many recommendations per poll |
 | `exclude_positions` | `K,DEF` | Positions to leave out |
+| `flex_penalty` | `8.0` | Discount for a player who only fills a flex slot |
+| `depth_penalty` | `20.0` | Discount for a position whose starting slots are full |
 | `sleeper_base_url` | Sleeper API | Override only to point at a test fixture |
 
 ### Mock drafts

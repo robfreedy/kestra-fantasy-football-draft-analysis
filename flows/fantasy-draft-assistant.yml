@@ -23,6 +23,11 @@ description: |
   A player's value score is how many picks past their expected slot they
   are still available. Positive is value, negative is a reach.
 
+  Recommendations are then adjusted for what I have already drafted: a player
+  at a position whose starting slots are full is discounted, so a backup
+  quarterback stops outranking a starter I still need. `flex_penalty` and
+  `depth_penalty` control how hard that bites.
+
 labels:
   owner: rob
   domain: fantasy-football
@@ -71,6 +76,24 @@ inputs:
       misleadingly strong Sleeper search rank for how late they are actually
       drafted, so they are excluded by default.
 
+  - id: flex_penalty
+    type: FLOAT
+    required: true
+    defaults: 8.0
+    description: >
+      Picks to discount a player who only fills a flex slot rather than a
+      starting one.
+
+  - id: depth_penalty
+    type: FLOAT
+    required: true
+    defaults: 20.0
+    description: >
+      Picks to discount a player at a position whose starting slots are already
+      filled, multiplied up the deeper the roster already is there. Raise this
+      to suppress backups harder; set both penalties to 0 to ignore my roster
+      and rank purely on value.
+
   - id: sleeper_base_url
     type: STRING
     required: true
@@ -99,6 +122,9 @@ tasks:
       ALERT_THRESHOLD: "{{ inputs.alert_threshold }}"
       TOP_N: "{{ inputs.top_n }}"
       EXCLUDE_POSITIONS: "{{ inputs.exclude_positions }}"
+      REQUIRE_NFL_TEAM: "true"
+      FLEX_PENALTY: "{{ inputs.flex_penalty }}"
+      DEPTH_PENALTY: "{{ inputs.depth_penalty }}"
       OUTPUT_FILE: draft_analysis.json
     commands:
       - python fantasy_football_analyzer.py
@@ -143,8 +169,10 @@ tasks:
                 Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }}
                 On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU, PICK NOW{% endif %}
 
-                Fallen furthest past their ranking:
-                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ranked #{{ item.overall_rank }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} (value +{{ item.value_score }})
+                Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
+
+                Best picks for my roster:
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ranked #{{ item.overall_rank }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} — {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }} for {{ item.need }}){% endif %}
                 {% endif %}{% endfor %}
           else:
             - id: status_update
@@ -155,8 +183,11 @@ tasks:
                 On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU{% endif %}
                 No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold }} picks past their rank.
 
-                Best available:
-                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — rank #{{ item.overall_rank }}, value {{ item.value_score }}
+                My roster: {{ outputs.analyze_draft.vars.analysis.my_roster_summary }}
+                Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
+
+                Best picks for my roster:
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — rank #{{ item.overall_rank }}, {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }}){% endif %}
                 {% endfor %}
 
       pre_draft:

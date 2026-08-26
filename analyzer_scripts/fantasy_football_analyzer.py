@@ -20,6 +20,13 @@ Both id settings also accept the Sleeper URL you copied them from.
   ALERT_THRESHOLD     Value score above which a player is flagged. Default 10.
   TOP_N               How many recommendations to return. Default 5.
   EXCLUDE_POSITIONS   Comma-separated positions to drop, e.g. "K,DEF".
+  REQUIRE_NFL_TEAM    Drop players with no NFL team, who cannot score. Default
+                      true; set false to include free agents.
+  FLEX_PENALTY        Picks to discount a player who only fills a flex slot
+                      rather than a starting one. Default 8.
+  DEPTH_PENALTY       Picks to discount a player at a position whose starting
+                      slots are already filled, multiplied up the deeper the
+                      roster already is there. Default 20.
   OUTPUT_FILE         Where to write the analysis JSON. Default draft_analysis.json.
   PLAYERS_CACHE_PATH  Where to cache the player pool. Default sleeper_players_cache.json.
 
@@ -45,6 +52,29 @@ DEFAULT_BASE_URL = "https://api.sleeper.app/v1"
 # Positions Sleeper uses for standard fantasy rosters. Everything else in the
 # player pool (OL, IDP, etc.) is noise for a redraft league.
 FANTASY_POSITIONS = frozenset({"QB", "RB", "WR", "TE", "K", "DEF"})
+
+# Sleeper describes a roster as `slots_*` counts in the draft settings. These
+# are the slots that must be filled by one specific position...
+DEDICATED_SLOTS = {
+    "slots_qb": "QB",
+    "slots_rb": "RB",
+    "slots_wr": "WR",
+    "slots_te": "TE",
+    "slots_k": "K",
+    "slots_def": "DEF",
+}
+
+# ...these take any of several positions...
+FLEX_SLOTS = {
+    "slots_flex": ("RB", "WR", "TE"),
+    "slots_super_flex": ("QB", "RB", "WR", "TE"),
+    "slots_rec_flex": ("WR", "TE"),
+}
+
+# ...and these are not starting slots at all, so they must not be counted as
+# positional need. `slots_bn` is bench; some leagues omit it and leave the
+# bench implied by the round count instead.
+NON_STARTER_SLOTS = ("slots_bn", "slots_ir", "slots_taxi")
 
 # Sleeper stores "no meaningful rank" as this sentinel rather than null.
 UNRANKED_SENTINEL = 9999999
@@ -395,12 +425,20 @@ class SleeperFantasyAnalyzer:
         drafted: Set[str],
         overall_ranks: Dict[str, int],
         exclude_positions: Set[str],
+        require_nfl_team: bool = True,
     ) -> List[Dict]:
         """Undrafted, rankable players, best first.
 
         Unranked players are dropped rather than pushed to the back: without
         a rank there is no value to estimate, and Sleeper marks thousands of
         deep-roster players this way.
+
+        Players with no NFL team are dropped too. Sleeper's `status` and
+        `active` flags do not reliably mark players who have left the league -
+        Todd Gurley, retired since 2021, is still listed as active with a
+        search rank of 27 - but having no team does, and someone on no roster
+        cannot score. In the top 80 ranked players this removes exactly two,
+        both of them noise.
         """
         available = []
         for player_id, player in players.items():
@@ -409,6 +447,8 @@ class SleeperFantasyAnalyzer:
             if player_id not in overall_ranks:
                 continue
             if player.get("position") in exclude_positions:
+                continue
+            if require_nfl_team and player.get("nfl_team") in (None, "", "FA"):
                 continue
             available.append({**player, "overall_rank": overall_ranks[player_id]})
 
@@ -427,24 +467,192 @@ class SleeperFantasyAnalyzer:
         """
         return float(current_pick - player["overall_rank"])
 
-    def get_recommendations(
-        self, available: List[Dict], current_pick: int, top_n: int
-    ) -> List[Dict]:
-        """Top-N available players by value score.
+    @staticmethod
+    def need_penalty(
+        need: str, position: str, needs: Dict, flex_penalty: float, depth_penalty: float
+    ) -> float:
+        """How much to discount a player for not filling a need.
 
-        ``available`` is already sorted by rank and the score is a strictly
-        decreasing function of rank at a fixed pick number, so the best
-        values are simply the best-ranked players still on the board.
+        Expressed in the same units as the value score - picks - so the two
+        can simply be added. Depth is penalised more the deeper I already am
+        at that position: a backup quarterback is a poor use of a pick, and a
+        third is worse.
         """
-        scored = [
-            {**player, "value_score": self.score_player_value(player, current_pick)}
-            for player in available[: max(top_n, 0)]
-        ]
-        return scored
+        if need == "starter":
+            return 0.0
+        if need == "flex":
+            return flex_penalty
+
+        already = needs["counts"].get(position, 0)
+        dedicated = needs["dedicated_slots"].get(position, 0)
+        return depth_penalty * (1 + max(0, already - dedicated))
+
+    def get_recommendations(
+        self,
+        available: List[Dict],
+        current_pick: int,
+        top_n: int,
+        needs: Dict,
+        flex_penalty: float,
+        depth_penalty: float,
+    ) -> List[Dict]:
+        """Best available players once my roster is taken into account.
+
+        Every available player has to be scored before ranking, not just the
+        best few: the need penalty breaks the tie between rank and score, so
+        a slightly worse player at a position I still need can - and should -
+        outrank a great player at one I have already filled.
+        """
+        scored = []
+        for player in available:
+            position = player.get("position") or ""
+            need = self.classify_need(position, needs)
+            penalty = self.need_penalty(
+                need, position, needs, flex_penalty, depth_penalty
+            )
+            raw = self.score_player_value(player, current_pick)
+            scored.append(
+                {
+                    **player,
+                    "value_score": raw,
+                    "need": need,
+                    "need_penalty": penalty,
+                    "adjusted_score": raw - penalty,
+                }
+            )
+
+        # Best adjusted score first, then better-ranked player as a tiebreak.
+        scored.sort(key=lambda p: (-p["adjusted_score"], p["overall_rank"]))
+        return scored[: max(top_n, 0)]
 
     # ------------------------------------------------------------------
     # Draft state
     # ------------------------------------------------------------------
+
+    def get_my_draft_slot(self, draft: Dict) -> Optional[int]:
+        """Which draft slot is mine, per Sleeper's draft order."""
+        if not self.user_id:
+            return None
+        slot = (draft.get("draft_order") or {}).get(self.user_id)
+        return slot if isinstance(slot, int) else None
+
+    @staticmethod
+    def get_my_picks(
+        picks: List[Dict], my_slot: Optional[int], user_id: Optional[str]
+    ) -> List[Dict]:
+        """The picks belonging to me.
+
+        Attribution goes by ``draft_slot``, which every pick carries. The
+        obvious-looking field, ``picked_by``, is blank on autopicked players
+        (15 of 150 in a real draft), so using it alone would quietly leave
+        players off my roster and overstate what I still need.
+        """
+        if my_slot is not None:
+            return [pick for pick in picks if pick.get("draft_slot") == my_slot]
+        if user_id:
+            return [pick for pick in picks if pick.get("picked_by") == user_id]
+        return []
+
+    @staticmethod
+    def summarize_roster(my_picks: List[Dict]) -> Dict[str, List[str]]:
+        """My drafted players grouped by position.
+
+        Read from each pick's own metadata rather than the player pool, so it
+        still works for anyone the pool has been pruned of.
+        """
+        roster: Dict[str, List[str]] = {}
+        for pick in my_picks:
+            metadata = pick.get("metadata") or {}
+            position = (metadata.get("position") or "").upper()
+            if not position:
+                continue
+            name = " ".join(
+                part
+                for part in (metadata.get("first_name"), metadata.get("last_name"))
+                if part
+            ).strip()
+            roster.setdefault(position, []).append(name or pick.get("player_id", "?"))
+        return roster
+
+    @staticmethod
+    def get_positional_needs(
+        draft: Dict,
+        roster: Dict[str, List[str]],
+        exclude_positions: Optional[Set[str]] = None,
+    ) -> Dict:
+        """What my roster is still missing.
+
+        Dedicated slots are filled first, then any surplus at a flex-eligible
+        position is treated as consuming a flex slot. Flex types are pooled
+        rather than solved exactly - the overlap between `flex` and
+        `super_flex` makes precise assignment a small optimisation problem,
+        and pooling is close enough to rank picks by.
+        """
+        settings = draft.get("settings") or {}
+        counts = {position: len(players) for position, players in roster.items()}
+
+        dedicated = {
+            position: settings.get(key) or 0
+            for key, position in DEDICATED_SLOTS.items()
+        }
+
+        starter_need, surplus = {}, {}
+        for position, slots in dedicated.items():
+            filled = counts.get(position, 0)
+            starter_need[position] = max(0, slots - filled)
+            surplus[position] = max(0, filled - slots)
+
+        flex_total = sum(settings.get(key) or 0 for key in FLEX_SLOTS)
+        flex_eligible = {
+            position
+            for key, positions in FLEX_SLOTS.items()
+            if settings.get(key)
+            for position in positions
+        }
+        flex_used = sum(surplus.get(position, 0) for position in flex_eligible)
+        flex_need = max(0, flex_total - flex_used)
+
+        starters_total = sum(dedicated.values()) + flex_total
+        bench_total = settings.get("slots_bn")
+        if not bench_total:
+            bench_total = max(0, (settings.get("rounds") or 0) - starters_total)
+
+        # Excluded positions are left out: reporting a need the flow will
+        # never recommend against is just noise. Note that Sleeper gives no
+        # search rank to any team defence, so DEF is never recommendable and
+        # is excluded by default for that reason as much as any other.
+        skip = exclude_positions or set()
+        still_needed = sorted(
+            position
+            for position, need in starter_need.items()
+            if need > 0 and position not in skip
+        )
+        return {
+            "dedicated_slots": dedicated,
+            "counts": counts,
+            "starter_need": starter_need,
+            "flex_slots": flex_total,
+            "flex_eligible": sorted(flex_eligible),
+            "flex_need": flex_need,
+            "bench_slots": bench_total,
+            "still_needed": still_needed,
+            # Preformatted for the flow's log templates: building these in
+            # Pebble would mean iterating a map, which is fragile.
+            "still_needed_summary": (
+                ", ".join(still_needed)
+                if still_needed
+                else "none - remaining picks are depth"
+            ),
+        }
+
+    @staticmethod
+    def classify_need(position: str, needs: Dict) -> str:
+        """Whether a position fills a starting slot, a flex slot, or is depth."""
+        if needs["starter_need"].get(position, 0) > 0:
+            return "starter"
+        if position in needs["flex_eligible"] and needs["flex_need"] > 0:
+            return "flex"
+        return "depth"
 
     @staticmethod
     def describe_draft(draft: Dict) -> Dict:
@@ -556,6 +764,13 @@ def run_analysis() -> Dict:
 
     threshold = _env_float("ALERT_THRESHOLD", 10.0)
     top_n = _env_int("TOP_N", 5)
+    require_nfl_team = os.getenv("REQUIRE_NFL_TEAM", "true").strip().lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+    flex_penalty = _env_float("FLEX_PENALTY", 8.0)
+    depth_penalty = _env_float("DEPTH_PENALTY", 20.0)
     exclude_positions = {
         part.strip().upper()
         for part in os.getenv("EXCLUDE_POSITIONS", "").split(",")
@@ -579,11 +794,16 @@ def run_analysis() -> Dict:
     clock = analyzer.get_draft_clock(draft, picks)
     on_the_clock = analyzer.get_on_the_clock(draft, clock)
 
+    my_slot = analyzer.get_my_draft_slot(draft)
+    my_picks = analyzer.get_my_picks(picks, my_slot, analyzer.user_id)
+    roster = analyzer.summarize_roster(my_picks)
+    needs = analyzer.get_positional_needs(draft, roster, exclude_positions)
+
     available = analyzer.get_available_players(
-        players, drafted, overall_ranks, exclude_positions
+        players, drafted, overall_ranks, exclude_positions, require_nfl_team
     )
     recommendations = analyzer.get_recommendations(
-        available, clock["current_pick"], top_n
+        available, clock["current_pick"], top_n, needs, flex_penalty, depth_penalty
     )
 
     formatted = [
@@ -595,7 +815,12 @@ def run_analysis() -> Dict:
             "nfl_team": player["nfl_team"],
             "overall_rank": player["overall_rank"],
             "value_score": round(player["value_score"], 2),
-            "alert": analyzer.should_alert(player["value_score"], threshold),
+            "need": player["need"],
+            "need_penalty": round(player["need_penalty"], 2),
+            "adjusted_score": round(player["adjusted_score"], 2),
+            # Alerting is on the roster-aware score, so a player at a position
+            # already filled cannot raise an alert on raw value alone.
+            "alert": analyzer.should_alert(player["adjusted_score"], threshold),
         }
         for i, player in enumerate(recommendations)
     ]
@@ -618,6 +843,16 @@ def run_analysis() -> Dict:
             "current_round": clock["current_round"],
         },
         "on_the_clock": on_the_clock,
+        "my_draft_slot": my_slot,
+        "my_roster": roster,
+        "my_roster_summary": (
+            ", ".join(
+                f"{position} {len(players)}"
+                for position, players in sorted(roster.items())
+            )
+            or "nothing drafted yet"
+        ),
+        "roster_needs": needs,
         "players_available": len(available),
         "alert_threshold": threshold,
         "recommendations": formatted,
@@ -653,15 +888,33 @@ def _summarize(result: Dict) -> str:
     if clock.get("slot"):
         mine = " (your pick)" if clock.get("is_my_pick") else ""
         lines.append(f"On the clock: slot {clock['slot']}{mine}")
+    roster = result.get("my_roster") or {}
+    needs = result.get("roster_needs") or {}
+    if roster:
+        held = ", ".join(
+            f"{position} {len(players)}" for position, players in sorted(roster.items())
+        )
+        total = sum(len(players) for players in roster.values())
+        lines.append(f"My roster ({total} picks): {held}")
+    still = needs.get("still_needed") or []
+    if still:
+        lines.append(f"Starters still needed: {', '.join(still)}")
+    elif roster:
+        lines.append("All starting slots filled - remaining picks are depth")
+
     lines.append(
         f"{result['players_available']} players available, "
         f"{result['high_value_alerts']} above the alert threshold"
     )
     for rec in result["recommendations"]:
         flag = " <-- ALERT" if rec["alert"] else ""
+        penalty = (
+            f" -{rec['need_penalty']:g} {rec['need']}" if rec["need_penalty"] else ""
+        )
         lines.append(
             f"  {rec['rank']}. {rec['name']} ({rec['position']}/{rec['nfl_team']}) "
-            f"rank #{rec['overall_rank']} value {rec['value_score']:+}{flag}"
+            f"rank #{rec['overall_rank']} value {rec['value_score']:+g}{penalty} "
+            f"=> {rec['adjusted_score']:+g}{flag}"
         )
     return "\n".join(lines)
 
@@ -678,6 +931,9 @@ def main() -> int:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "draft_status": {"status": "error"},
             "draft_info": {"is_mock": False, "name": "", "scoring_type": ""},
+            "my_roster": {},
+            "my_roster_summary": "",
+            "roster_needs": {"still_needed": [], "still_needed_summary": ""},
             "recommendations": [],
             "high_value_alerts": 0,
             "is_drafting": False,
