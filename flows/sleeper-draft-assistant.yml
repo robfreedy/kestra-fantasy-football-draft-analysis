@@ -1,15 +1,17 @@
-id: fantasy-draft-assistant
+id: sleeper-draft-assistant
 namespace: test.robs-test
 
 description: |
-  Fantasy Football Draft Decision Assistant
+  Sleeper Fantasy Football Draft Decision Assistant
 
   Polls a live Sleeper draft and logs the best-value players still on the
   board, raising an alert when someone falls well past their ranking.
 
   Setup:
-    1. Upload `fantasy_football_analyzer.py` as a Namespace File in this
-       namespace (the `analyze_draft` task loads it from there).
+    1. Upload `sleeper_fantasy_analyzer.py` and `draft_analysis.py` as
+       Namespace Files in this namespace (the `analyze_draft` task loads both
+       from there). `draft_analysis.py` is the provider-agnostic scoring logic,
+       shared with the Yahoo flow.
     2. Set `league_or_draft_id` to whichever id you have - a league id from
        https://sleeper.com/leagues/<league_id>/... or a draft id from
        https://sleeper.com/draft/nfl/<draft_id>. Which kind it is gets
@@ -31,6 +33,7 @@ description: |
 labels:
   owner: rob
   domain: fantasy-football
+  provider: sleeper
 
 inputs:
   - id: league_or_draft_id
@@ -107,7 +110,8 @@ tasks:
     namespaceFiles:
       enabled: true
       include:
-        - fantasy_football_analyzer.py
+        - sleeper_fantasy_analyzer.py
+        - draft_analysis.py
         # Injected only once it exists; the first run builds it.
         - sleeper_players_cache.json
     taskRunner:
@@ -122,12 +126,11 @@ tasks:
       ALERT_THRESHOLD: "{{ inputs.alert_threshold }}"
       TOP_N: "{{ inputs.top_n }}"
       EXCLUDE_POSITIONS: "{{ inputs.exclude_positions }}"
-      REQUIRE_NFL_TEAM: "true"
       FLEX_PENALTY: "{{ inputs.flex_penalty }}"
       DEPTH_PENALTY: "{{ inputs.depth_penalty }}"
       OUTPUT_FILE: draft_analysis.json
     commands:
-      - python fantasy_football_analyzer.py
+      - python sleeper_fantasy_analyzer.py
     outputFiles:
       - draft_analysis.json
       - sleeper_players_cache.json
@@ -169,7 +172,7 @@ tasks:
                 Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }}
                 On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU, PICK NOW{% endif %}
 
-                Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
+                Starters still needed: {% if outputs.analyze_draft.vars.analysis.roster_needs.still_needed is empty %}none — remaining picks are depth{% else %}{{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed | join(', ') }}{% endif %}
 
                 Best picks for my roster:
                 {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ranked #{{ item.overall_rank }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} — {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }} for {{ item.need }}){% endif %}
@@ -183,8 +186,8 @@ tasks:
                 On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU{% endif %}
                 No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold }} picks past their rank.
 
-                My roster: {{ outputs.analyze_draft.vars.analysis.my_roster_summary }}
-                Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
+                My roster: {% for position, players in outputs.analyze_draft.vars.analysis.my_roster %}{{ position }} {{ players | length }}{% if not loop.last %}, {% endif %}{% endfor %}{% if outputs.analyze_draft.vars.analysis.my_roster is empty %}nothing drafted yet{% endif %}
+                Starters still needed: {% if outputs.analyze_draft.vars.analysis.roster_needs.still_needed is empty %}none — remaining picks are depth{% else %}{{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed | join(', ') }}{% endif %}
 
                 Best picks for my roster:
                 {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — rank #{{ item.overall_rank }}, {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }}){% endif %}
@@ -216,7 +219,7 @@ tasks:
       Keep the latest analysis in the KV store so a later run (or another flow)
       can diff against it. Every run's full draft_analysis.json is also kept in
       internal storage as the durable history.
-    key: last_draft_analysis
+    key: sleeper_last_draft_analysis
     kvType: JSON
     overwrite: true
     ttl: P7D

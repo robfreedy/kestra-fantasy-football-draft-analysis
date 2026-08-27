@@ -1,0 +1,264 @@
+id: yahoo-draft-assistant
+namespace: test.robs-test
+
+description: |
+  Yahoo Fantasy Football Draft Decision Assistant
+
+  Polls a live Yahoo Fantasy draft and logs the best-value players still on the
+  board, weighted by what my roster still needs. The Sleeper twin of this flow
+  is `sleeper-draft-assistant`; the scoring is identical and lives in the shared
+  `draft_analysis.py` Namespace File.
+
+  Setup:
+    1. Upload `yahoo_fantasy_analyzer.py` and `draft_analysis.py` as Namespace
+       Files in this namespace.
+    2. Register an app at https://developer.yahoo.com/apps/ with Fantasy Sports
+       read permission, then authorize it once to get a refresh token.
+    3. Add three Namespace Secrets: YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET and
+       YAHOO_REFRESH_TOKEN.
+    4. Set `league_key` to your league, e.g. 449.l.123456. The numeric prefix is
+       Yahoo's game key and changes every season; a bare league id or the league
+       URL also works and is completed using `game_key`.
+    5. Enable the `poll_during_draft` trigger while the draft is running.
+
+  Unlike Sleeper, Yahoo publishes a real average draft position, so a player's
+  expected pick is their actual ADP rather than a rank standing in for one.
+
+  Yahoo access tokens last one hour, which is shorter than a draft, so the
+  token is cached in the KV store and refreshed only once it is close to
+  expiring rather than on every poll.
+
+labels:
+  owner: rob
+  domain: fantasy-football
+  provider: yahoo
+
+inputs:
+  - id: league_key
+    type: STRING
+    required: true
+    defaults: ""
+    description: >
+      The Yahoo league to watch, e.g. 449.l.123456. A bare league id or the
+      league URL also works and is completed using game_key. This is not your
+      Yahoo user id.
+
+  - id: game_key
+    type: STRING
+    required: true
+    defaults: "nfl"
+    description: >
+      Game key to assume when league_key is a bare league id. "nfl" resolves to
+      the current season; use a numeric key like 449 to pin an older one.
+
+  - id: alert_threshold
+    type: FLOAT
+    required: true
+    defaults: 10.0
+    description: Flag a player once they have fallen this many picks past their ADP.
+
+  - id: top_n
+    type: INT
+    required: true
+    defaults: 5
+    description: How many recommendations to report each poll.
+
+  - id: exclude_positions
+    type: STRING
+    required: true
+    defaults: "K,DEF"
+    description: Positions to leave out of recommendations.
+
+  - id: flex_penalty
+    type: FLOAT
+    required: true
+    defaults: 8.0
+    description: >
+      Picks to discount a player who only fills a flex slot rather than a
+      starting one.
+
+  - id: depth_penalty
+    type: FLOAT
+    required: true
+    defaults: 20.0
+    description: >
+      Picks to discount a player at a position whose starting slots are already
+      filled, multiplied up the deeper the roster already is there. Raise this
+      to suppress backups harder; set both penalties to 0 to ignore my roster
+      and rank purely on value.
+
+  - id: player_pages
+    type: INT
+    required: true
+    defaults: 4
+    description: >
+      How many 25-player pages of available players to pull, best-ranked first.
+      Four is the top 100, which is deeper than any pick realistically reaches.
+      Each page is one API call, so raising this makes every poll more
+      expensive.
+
+  - id: yahoo_base_url
+    type: STRING
+    required: true
+    defaults: "https://fantasysports.yahooapis.com/fantasy/v2"
+    description: Yahoo API root. Override only to point at a test fixture.
+
+  - id: yahoo_token_url
+    type: STRING
+    required: true
+    defaults: "https://api.login.yahoo.com/oauth2/get_token"
+    description: Yahoo OAuth token endpoint. Override only to point at a test fixture.
+
+tasks:
+  - id: read_cached_token
+    type: io.kestra.plugin.core.kv.Get
+    description: >
+      The access token cached by an earlier poll. Missing on the first run,
+      which is fine - the analyzer mints one from the refresh token.
+    key: yahoo_access_token
+    errorOnMissing: false
+
+  - id: analyze_draft
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Pull the live draft from Yahoo and score the remaining players.
+    namespaceFiles:
+      enabled: true
+      include:
+        - yahoo_fantasy_analyzer.py
+        - draft_analysis.py
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.13-slim
+    beforeCommands:
+      - pip install --quiet --no-cache-dir requests
+    env:
+      YAHOO_LEAGUE_KEY: "{{ inputs.league_key }}"
+      YAHOO_GAME_KEY: "{{ inputs.game_key }}"
+      YAHOO_BASE_URL: "{{ inputs.yahoo_base_url }}"
+      YAHOO_TOKEN_URL: "{{ inputs.yahoo_token_url }}"
+      YAHOO_CLIENT_ID: "{{ secret('YAHOO_CLIENT_ID') }}"
+      YAHOO_CLIENT_SECRET: "{{ secret('YAHOO_CLIENT_SECRET') }}"
+      YAHOO_REFRESH_TOKEN: "{{ secret('YAHOO_REFRESH_TOKEN') }}"
+      # Absent on the first poll; `??` keeps the expression resolvable, which a
+      # plain reference to a missing KV value is not.
+      YAHOO_ACCESS_TOKEN: "{{ outputs.read_cached_token.value.access_token ?? '' }}"
+      YAHOO_ACCESS_TOKEN_EXPIRES_AT: "{{ outputs.read_cached_token.value.expires_at ?? '0' }}"
+      YAHOO_PLAYER_PAGES: "{{ inputs.player_pages }}"
+      ALERT_THRESHOLD: "{{ inputs.alert_threshold }}"
+      TOP_N: "{{ inputs.top_n }}"
+      EXCLUDE_POSITIONS: "{{ inputs.exclude_positions }}"
+      REQUIRE_NFL_TEAM: "true"
+      FLEX_PENALTY: "{{ inputs.flex_penalty }}"
+      DEPTH_PENALTY: "{{ inputs.depth_penalty }}"
+      OUTPUT_FILE: draft_analysis.json
+    commands:
+      - python yahoo_fantasy_analyzer.py
+    outputFiles:
+      - draft_analysis.json
+
+  - id: cache_access_token
+    type: io.kestra.plugin.core.flow.If
+    description: >
+      Store a freshly minted token so later polls reuse it. Only the rotating
+      access token is cached here - the long-lived refresh token stays a Secret.
+    condition: "{{ outputs.analyze_draft.vars.token.refreshed ?? false }}"
+    then:
+      - id: write_access_token
+        type: io.kestra.plugin.core.kv.Set
+        key: yahoo_access_token
+        kvType: JSON
+        overwrite: true
+        # Yahoo tokens last an hour; expire the cache entry a little after that
+        # so a stale token cannot linger if the flow stops running.
+        ttl: PT2H
+        value: "{{ outputs.analyze_draft.vars.token | toJson }}"
+
+  - id: route_by_draft_status
+    type: io.kestra.plugin.core.flow.Switch
+    description: Only the live-draft branch is worth acting on.
+    value: "{{ outputs.analyze_draft.vars.analysis.draft_status.status }}"
+    cases:
+      drafting:
+        - id: check_for_alerts
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.analyze_draft.vars.analysis.high_value_alerts > 0 }}"
+          then:
+            - id: alert_user
+              type: io.kestra.plugin.core.log.Log
+              level: WARN
+              message: |
+                🚨 DRAFT ALERT! 🚨
+                Yahoo draft {{ outputs.analyze_draft.vars.analysis.draft_info.name }} ({{ outputs.analyze_draft.vars.analysis.league_key }})
+                {{ outputs.analyze_draft.vars.analysis.high_value_alerts }} high-value player(s) still on the board.
+
+                Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }}
+                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU, PICK NOW{% endif %}
+
+                Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
+
+                Best picks for my roster:
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ADP {{ item.expected_pick }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} — {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }} for {{ item.need }}){% endif %}
+                {% endif %}{% endfor %}
+          else:
+            - id: status_update
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                Yahoo draft update: {{ outputs.analyze_draft.vars.analysis.draft_info.name }} ({{ outputs.analyze_draft.vars.analysis.league_key }}) — {{ outputs.analyze_draft.vars.analysis.timestamp }}
+                Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} ({{ outputs.analyze_draft.vars.analysis.draft_status.picks_remaining }} remaining)
+                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU{% endif %}
+                No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold }} picks past their ADP.
+
+                My roster: {{ outputs.analyze_draft.vars.analysis.my_roster_summary }}
+                Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
+
+                Best picks for my roster:
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ADP {{ item.expected_pick }}, {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }}){% endif %}
+                {% endfor %}
+
+      pre_draft:
+        - id: not_started
+          type: io.kestra.plugin.core.log.Log
+          message: |
+            Yahoo draft for {{ outputs.analyze_draft.vars.analysis.league_key }} has not started yet.
+            {{ outputs.analyze_draft.vars.analysis.draft_status.teams }} teams × {{ outputs.analyze_draft.vars.analysis.draft_status.rounds }} rounds = {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} picks.
+
+      complete:
+        - id: draft_finished
+          type: io.kestra.plugin.core.log.Log
+          message: |
+            Yahoo draft for {{ outputs.analyze_draft.vars.analysis.league_key }} is complete — {{ outputs.analyze_draft.vars.analysis.draft_status.picks_made }} picks made.
+            Final roster: {{ outputs.analyze_draft.vars.analysis.my_roster_summary }}
+            You can disable the `poll_during_draft` trigger now.
+
+    defaults:
+      - id: unexpected_status
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: "Yahoo reports draft state '{{ outputs.analyze_draft.vars.analysis.draft_status.status }}' — nothing to recommend."
+
+  - id: save_snapshot
+    type: io.kestra.plugin.core.kv.Set
+    description: >
+      Keep the latest analysis in the KV store so a later run (or another flow)
+      can diff against it. Every run's full draft_analysis.json is also kept in
+      internal storage as the durable history.
+    key: yahoo_last_draft_analysis
+    kvType: JSON
+    overwrite: true
+    ttl: P7D
+    value: "{{ outputs.analyze_draft.vars.analysis | toJson }}"
+
+triggers:
+  - id: poll_during_draft
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    description: >
+      Enable this while your draft is live. Polls every minute rather than every
+      30 seconds like the Sleeper flow: each Yahoo poll costs several API calls
+      (league, draft board, and one per player page) where Sleeper costs two,
+      and Yahoo throttles noisy clients.
+    # Scheduled runs get the inputs' default values, so `league_key` above must
+    # have the right default before this is enabled.
+    cron: "* * * * *"
+    # A slow Yahoo response should not stack up overlapping polls.
+    allowConcurrent: false
