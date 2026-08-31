@@ -1,5 +1,5 @@
 id: sleeper-draft-assistant
-namespace: test.robs-test
+namespace: sleeper
 
 description: |
   Sleeper Fantasy Football Draft Decision Assistant
@@ -9,9 +9,11 @@ description: |
 
   Setup:
     1. Upload `sleeper_fantasy_analyzer.py` and `draft_analysis.py` as
-       Namespace Files in this namespace (the `analyze_draft` task loads both
-       from there). `draft_analysis.py` is the provider-agnostic scoring logic,
-       shared with the Yahoo flow.
+       Namespace Files in the `sleeper` namespace (the `analyze_draft` task
+       loads both from there). `draft_analysis.py` is the provider-agnostic
+       scoring logic; the Yahoo twin of this flow lives in `yahoo-sports` and
+       keeps its own copy of that file, so a change to the scoring model has to
+       be uploaded to both namespaces.
     2. Set `league_or_draft_id` to whichever id you have - a league id from
        https://sleeper.com/leagues/<league_id>/... or a draft id from
        https://sleeper.com/draft/nfl/<draft_id>. Which kind it is gets
@@ -228,7 +230,7 @@ tasks:
 triggers:
   - id: poll_during_draft
     type: io.kestra.plugin.core.trigger.Schedule
-    disabled: false
+    disabled: true
     description: Enable this while your draft is live. Polls every 30 seconds.
     # Scheduled runs get the inputs' default values, so `league_or_draft_id`
     # above must have the right default before this is enabled.

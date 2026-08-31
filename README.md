@@ -103,28 +103,49 @@ a Namespace File.
 
 ## Deploying
 
-Both flows run their analyzer as **Namespace Files**, so the scripts have to be
-uploaded as well as the flows:
+Each flow lives in its own namespace, and each namespace holds its own copy of
+the analyzer scripts:
+
+| Namespace | Flow | Namespace Files |
+|---|---|---|
+| `sleeper` | `sleeper-draft-assistant` | `draft_analysis.py`, `sleeper_fantasy_analyzer.py` |
+| `yahoo-sports` | `yahoo-draft-assistant` | `draft_analysis.py`, `yahoo_fantasy_analyzer.py` |
+
+Because `draft_analysis.py` is copied into both namespaces, a change to the
+shared scoring model has to be uploaded twice — the script block below does
+that.
+
+Deployment uses [`kestractl`](https://github.com/kestra-io/kestractl), Kestra's
+standalone CLI (a separate release from the server binary; the server's own
+`kestra` CLI no longer pushes flows to a remote instance). Configure a context
+once:
 
 ```bash
-KESTRA=http://localhost:8080/api/v1/default
-NS=test.robs-test
-AUTH='admin@kestra.io:PASSWORD'
-
-# Scripts: the shared module plus whichever clients you need
-for f in draft_analysis.py sleeper_fantasy_analyzer.py yahoo_fantasy_analyzer.py; do
-  curl -u "$AUTH" -X POST "$KESTRA/namespaces/$NS/files?path=/$f" \
-    -F "fileContent=@analyzer_scripts/$f"
-done
-
-# Flows
-for f in flows/sleeper-draft-assistant.yml flows/yahoo-draft-assistant.yml; do
-  curl -u "$AUTH" -X POST "$KESTRA/flows" \
-    -H "Content-Type: application/x-yaml" --data-binary "@$f"
-done
+kestractl config add local http://localhost:8080 default \
+  --username 'admin@kestra.io' --password 'PASSWORD' --default
 ```
 
-Re-deploying an existing flow uses `PUT $KESTRA/flows/$NS/<flow-id>`.
+Then deploy scripts and flows:
+
+```bash
+# Namespace Files: the shared module plus each provider's client
+kestractl nsfiles upload sleeper analyzer_scripts/draft_analysis.py \
+  draft_analysis.py --override
+kestractl nsfiles upload sleeper analyzer_scripts/sleeper_fantasy_analyzer.py \
+  sleeper_fantasy_analyzer.py --override
+
+kestractl nsfiles upload yahoo-sports analyzer_scripts/draft_analysis.py \
+  draft_analysis.py --override
+kestractl nsfiles upload yahoo-sports analyzer_scripts/yahoo_fantasy_analyzer.py \
+  yahoo_fantasy_analyzer.py --override
+
+# Flows: each file's own `namespace:` field decides where it lands
+kestractl flows validate ./flows/
+kestractl flows deploy ./flows/ --override
+```
+
+`--override` is what makes both commands idempotent; without it they refuse to
+replace anything that already exists.
 
 ### Requirements on the Kestra instance
 
@@ -206,9 +227,9 @@ more setup than Sleeper.
    access tokens last one hour; the refresh token is long-lived and is what
    lets the flow run unattended.
 3. Add three **Namespace Secrets**: `YAHOO_CLIENT_ID`, `YAHOO_CLIENT_SECRET`
-   and `YAHOO_REFRESH_TOKEN`. Either through the Kestra UI
-   (Namespaces → your namespace → Secrets), or as `SECRET_<NAME>` environment
-   variables on the Kestra server holding the base64-encoded value:
+   and `YAHOO_REFRESH_TOKEN`, on the `yahoo-sports` namespace. Either through
+   the Kestra UI (Namespaces → `yahoo-sports` → Secrets), or as `SECRET_<NAME>`
+   environment variables on the Kestra server holding the base64-encoded value:
    ```bash
    SECRET_YAHOO_CLIENT_ID=$(printf %s "$CLIENT_ID" | base64)
    ```

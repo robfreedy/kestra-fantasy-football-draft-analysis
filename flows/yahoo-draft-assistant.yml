@@ -1,17 +1,19 @@
 id: yahoo-draft-assistant
-namespace: test.robs-test
+namespace: yahoo-sports
 
 description: |
   Yahoo Fantasy Football Draft Decision Assistant
 
   Polls a live Yahoo Fantasy draft and logs the best-value players still on the
   board, weighted by what my roster still needs. The Sleeper twin of this flow
-  is `sleeper-draft-assistant`; the scoring is identical and lives in the shared
-  `draft_analysis.py` Namespace File.
+  is `sleeper-draft-assistant` in the `sleeper` namespace; the scoring is
+  identical and lives in `draft_analysis.py`, which each namespace keeps its own
+  copy of.
 
   Setup:
     1. Upload `yahoo_fantasy_analyzer.py` and `draft_analysis.py` as Namespace
-       Files in this namespace.
+       Files in the `yahoo-sports` namespace. A change to `draft_analysis.py`
+       has to be uploaded to `sleeper` as well.
     2. Register an app at https://developer.yahoo.com/apps/ with Fantasy Sports
        read permission, then authorize it once to get a refresh token.
     3. Add three Namespace Secrets: YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET and
