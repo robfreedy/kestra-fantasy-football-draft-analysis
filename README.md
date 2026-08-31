@@ -218,11 +218,29 @@ a 30-second poll costs two small draft API calls.
 Yahoo's API is OAuth 2.0 only — there is no public read path — so this takes
 more setup than Sleeper.
 
+> **Status: blocked on Yahoo API approval.** Yahoo now gates Fantasy Sports API
+> access behind a review process (<https://sports.yahoo.com/developer/access/>),
+> and until an application is approved the **Fantasy Sports** permission does
+> not appear in the app's API Permissions at all — the console offers only the
+> OpenID Connect scopes. A token minted without that entitlement is valid but
+> every `fantasysports.yahooapis.com` call returns
+> `oauth_problem="additional_authorization_required"`. Nothing in this flow can
+> be tested until approval lands. Use the Sleeper flow in the meantime.
+>
+> Application submitted 2026-08-31; no approval timeline is published. On
+> approval, the credentials already in the KV store stay valid, but
+> `scripts/yahoo_refresh_token.sh` must be re-run: permissions are not
+> retroactive, so an existing grant keeps its original (scope-less) consent.
+
 ### One-time setup
 
-1. Register an app at <https://developer.yahoo.com/apps/> with **Fantasy
-   Sports → Read** permission. Yahoo calls the credentials Consumer Key and
-   Consumer Secret.
+1. Apply for Fantasy Sports API access at
+   <https://sports.yahoo.com/developer/access/> — say that use is limited to a
+   single personal league and pick the "Small (<1,000 users)" band. Once
+   approved, register an app at <https://developer.yahoo.com/apps/> (or attach
+   the approval to an existing one) and enable **Fantasy Sports → Read**.
+   Yahoo calls the credentials Consumer Key and Consumer Secret. Read access is
+   all this flow needs; Yahoo does not currently grant write access.
 2. Authorize the app once as yourself to obtain a **refresh token**. Yahoo's
    access tokens last one hour; the refresh token is long-lived and is what
    lets the flow run unattended. Run `scripts/yahoo_refresh_token.sh`, which

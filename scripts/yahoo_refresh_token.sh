@@ -26,11 +26,36 @@ AUTH_URL="https://api.login.yahoo.com/oauth2/request_auth"
 command -v kestractl >/dev/null || { echo "kestractl not on PATH" >&2; exit 1; }
 command -v openssl   >/dev/null || { echo "openssl not on PATH" >&2; exit 1; }
 
-if [ -z "$CLIENT_ID" ]; then
+# Read a KV value, or print nothing if the key is absent.
+kv_read() {
+  kestractl kv get "$NAMESPACE" "$1" -o json 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("value","") or "")
+except Exception: pass' 2>/dev/null
+}
+
+# Credentials come from the environment, else the KV store, else a prompt. The
+# KV lookup means a re-run after the app credentials are already loaded needs no
+# retyping - and nothing sensitive is defaulted into this public repo.
+[ -n "$CLIENT_ID" ] || CLIENT_ID=$(kv_read YAHOO_CLIENT_ID)
+if [ -n "$CLIENT_ID" ]; then
+  echo "Using YAHOO_CLIENT_ID from ${NAMESPACE} KV store."
+else
   echo "Client ID (Consumer Key) from https://developer.yahoo.com/apps/ :"
   printf '> '
   read -r CLIENT_ID
   [ -n "$CLIENT_ID" ] || { echo "No client id entered." >&2; exit 1; }
+fi
+
+CLIENT_SECRET="${YAHOO_CLIENT_SECRET:-}"
+[ -n "$CLIENT_SECRET" ] || CLIENT_SECRET=$(kv_read YAHOO_CLIENT_SECRET)
+if [ -n "$CLIENT_SECRET" ]; then
+  echo "Using YAHOO_CLIENT_SECRET from ${NAMESPACE} KV store."
+else
+  printf 'Client secret (hidden): '
+  read -rs CLIENT_SECRET
+  printf '\n'
+  [ -n "$CLIENT_SECRET" ] || { echo "No client secret entered." >&2; exit 1; }
 fi
 
 # 1. PKCE pair. The verifier is the secret half and stays in this process.
@@ -55,11 +80,7 @@ fi
 printf '\nAuthorization code: '
 read -r AUTH_CODE
 [ -n "$AUTH_CODE" ] || { echo "No code entered." >&2; exit 1; }
-
-printf 'Client secret (hidden): '
-read -rs CLIENT_SECRET
-printf '\n\n'
-[ -n "$CLIENT_SECRET" ] || { echo "No client secret entered." >&2; exit 1; }
+printf '\n'
 
 # 3. Exchange the code for tokens. Credentials go in the Basic auth header,
 #    the verifier proves this is the same client that started the flow.
