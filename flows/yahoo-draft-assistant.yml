@@ -16,8 +16,10 @@ description: |
        has to be uploaded to `sleeper` as well.
     2. Register an app at https://developer.yahoo.com/apps/ with Fantasy Sports
        read permission, then authorize it once to get a refresh token.
-    3. Add three Namespace Secrets: YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET and
-       YAHOO_REFRESH_TOKEN.
+    3. Add three KV store entries in this namespace: YAHOO_CLIENT_ID,
+       YAHOO_CLIENT_SECRET and YAHOO_REFRESH_TOKEN. Namespace Secrets would be
+       the better home, but their backend is broken on the 2.0 RC - see the
+       comment on the `analyze_draft` env block.
     4. Set `league_key` to your league, e.g. 449.l.123456. The numeric prefix is
        Yahoo's game key and changes every season; a bare league id or the league
        URL also works and is completed using `game_key`.
@@ -138,9 +140,16 @@ tasks:
       YAHOO_GAME_KEY: "{{ inputs.game_key }}"
       YAHOO_BASE_URL: "{{ inputs.yahoo_base_url }}"
       YAHOO_TOKEN_URL: "{{ inputs.yahoo_token_url }}"
-      YAHOO_CLIENT_ID: "{{ secret('YAHOO_CLIENT_ID') }}"
-      YAHOO_CLIENT_SECRET: "{{ secret('YAHOO_CLIENT_SECRET') }}"
-      YAHOO_REFRESH_TOKEN: "{{ secret('YAHOO_REFRESH_TOKEN') }}"
+      # These come from the KV store rather than Namespace Secrets, whose
+      # backend is broken on the 2.0 RC this runs against (the secrets
+      # controller cannot choose between its JDBC and Elasticsearch beans).
+      # `kv()` errors on a missing key, so a half-configured namespace fails
+      # loudly here rather than sending an unauthenticated request to Yahoo.
+      # Trade-off: unlike `secret()`, KV values are NOT masked in execution
+      # logs. Move these back to `secret()` once the backend is fixed.
+      YAHOO_CLIENT_ID: "{{ kv('YAHOO_CLIENT_ID') }}"
+      YAHOO_CLIENT_SECRET: "{{ kv('YAHOO_CLIENT_SECRET') }}"
+      YAHOO_REFRESH_TOKEN: "{{ kv('YAHOO_REFRESH_TOKEN') }}"
       # Absent on the first poll; `??` keeps the expression resolvable, which a
       # plain reference to a missing KV value is not.
       YAHOO_ACCESS_TOKEN: "{{ outputs.read_cached_token.value.access_token ?? '' }}"

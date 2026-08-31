@@ -225,11 +225,26 @@ more setup than Sleeper.
    Consumer Secret.
 2. Authorize the app once as yourself to obtain a **refresh token**. Yahoo's
    access tokens last one hour; the refresh token is long-lived and is what
-   lets the flow run unattended.
-3. Add three **Namespace Secrets**: `YAHOO_CLIENT_ID`, `YAHOO_CLIENT_SECRET`
-   and `YAHOO_REFRESH_TOKEN`, on the `yahoo-sports` namespace. Either through
-   the Kestra UI (Namespaces → `yahoo-sports` → Secrets), or as `SECRET_<NAME>`
-   environment variables on the Kestra server holding the base64-encoded value:
+   lets the flow run unattended. Run `scripts/yahoo_refresh_token.sh`, which
+   walks through the authorization and loads all three credentials into the KV
+   store for you. Yahoo requires PKCE, so the `code_verifier` has to survive
+   between the authorize step and the token exchange — hence a script rather
+   than two `curl` calls.
+3. Add three **KV store entries** on the `yahoo-sports` namespace:
+   ```bash
+   kestractl kv set yahoo-sports STRING YAHOO_CLIENT_ID     "$CLIENT_ID"
+   kestractl kv set yahoo-sports STRING YAHOO_CLIENT_SECRET "$CLIENT_SECRET"
+   kestractl kv set yahoo-sports STRING YAHOO_REFRESH_TOKEN "$REFRESH_TOKEN"
+   ```
+   **Namespace Secrets are the better home for these** — `secret()` values are
+   masked in execution logs and KV values are not. The flow reads them with
+   `kv()` only because the secrets backend is broken on the 2.0 RC used here:
+   the controller cannot choose between its JDBC and Elasticsearch beans, so
+   writes fail with a bean-resolution error. Setting `kestra.secret.type` in
+   the server config fixes it; after that, switch the three `kv()` calls in
+   `flows/yahoo-draft-assistant.yml` back to `secret()` and store them as
+   secrets instead — either through the UI (Namespaces → `yahoo-sports` →
+   Secrets) or as `SECRET_<NAME>` env vars holding the base64-encoded value:
    ```bash
    SECRET_YAHOO_CLIENT_ID=$(printf %s "$CLIENT_ID" | base64)
    ```
