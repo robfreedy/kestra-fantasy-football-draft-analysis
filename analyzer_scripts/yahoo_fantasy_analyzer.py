@@ -6,11 +6,13 @@ Polls a live Yahoo Fantasy draft and reports the best-value players still on
 the board, weighted by what my roster still needs.
 
 Scoring, roster-need penalties and reporting all live in `draft_analysis.py`,
-shared with the Sleeper analyzer. This module is only the Yahoo client and the
-normalization of Yahoo's data into the shapes that module expects.
+shared with the Sleeper and CBS analyzers. This module is only the Yahoo
+client and the normalization of Yahoo's data into the shapes that module
+expects.
 
-Unlike Sleeper, Yahoo publishes a real average draft position, so a player's
-expected pick is their actual ADP rather than a rank standing in for one.
+Yahoo is the only one of the three providers that publishes a real average
+draft position, so a player's expected pick is their actual ADP rather than a
+rank standing in for one.
 
 Yahoo's API is OAuth 2.0 only. Access tokens last one hour, which is shorter
 than a draft, so a refresh token is required and the access token is refreshed
@@ -56,7 +58,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set
 
 import requests
 
@@ -562,7 +564,7 @@ class YahooAnalyzer:
 
         Yahoo has no public mock-draft API - mocks are a separate pre-draft
         product and are not exposed as league resources - so `is_mock` is
-        always false here. The field is kept so both providers emit the same
+        always false here. The field is kept so every provider emits the same
         payload shape.
         """
         settings = merge_fragments(league.get("settings"))
@@ -604,7 +606,7 @@ class YahooAnalyzer:
         """Map Yahoo's draft_status onto the states the flow switches on.
 
         Yahoo says predraft/drafting/postdraft; the flow's cases are named for
-        Sleeper's vocabulary, so both providers are translated to the same set
+        Sleeper's vocabulary, so every provider is translated to the same set
         rather than the flow needing to know which platform it is reading.
         """
         return {

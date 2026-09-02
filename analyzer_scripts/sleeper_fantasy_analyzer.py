@@ -6,8 +6,9 @@ Polls a live Sleeper draft and reports the best-value players still on the
 board, weighted by what my roster still needs.
 
 Scoring, roster-need penalties and reporting all live in `draft_analysis.py`,
-shared with the Yahoo analyzer. This module is only the Sleeper client and the
-normalization of Sleeper's data into the shapes that module expects.
+shared with the Yahoo and CBS analyzers. This module is only the Sleeper
+client and the normalization of Sleeper's data into the shapes that module
+expects.
 
 Configuration is entirely via environment variables:
 

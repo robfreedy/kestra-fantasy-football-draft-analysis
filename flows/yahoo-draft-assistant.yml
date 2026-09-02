@@ -5,28 +5,30 @@ description: |
   Yahoo Fantasy Football Draft Decision Assistant
 
   Polls a live Yahoo Fantasy draft and logs the best-value players still on the
-  board, weighted by what my roster still needs. The Sleeper twin of this flow
-  is `sleeper-draft-assistant` in the `sleeper` namespace; the scoring is
-  identical and lives in `draft_analysis.py`, which each namespace keeps its own
-  copy of.
+  board, weighted by what my roster still needs. The twins of this flow are
+  `sleeper-draft-assistant` in the `sleeper` namespace and `cbs-draft-assistant`
+  in `cbs-sports`; the scoring is identical and lives in `draft_analysis.py`,
+  which each namespace keeps its own copy of.
 
   Setup:
     1. Upload `yahoo_fantasy_analyzer.py` and `draft_analysis.py` as Namespace
        Files in the `yahoo-sports` namespace. A change to `draft_analysis.py`
-       has to be uploaded to `sleeper` as well.
+       has to be uploaded to `sleeper` and `cbs-sports` as well.
     2. Register an app at https://developer.yahoo.com/apps/ with Fantasy Sports
        read permission, then authorize it once to get a refresh token.
     3. Add three KV store entries in this namespace: YAHOO_CLIENT_ID,
-       YAHOO_CLIENT_SECRET and YAHOO_REFRESH_TOKEN. Namespace Secrets would be
-       the better home, but their backend is broken on the 2.0 RC - see the
-       comment on the `analyze_draft` env block.
+       YAHOO_CLIENT_SECRET and YAHOO_REFRESH_TOKEN.
+       `scripts/yahoo_refresh_token.sh` loads all three for you. Namespace
+       Secrets would be the better home, but `kestra.secret.type` is unset on
+       this instance - see the comment on the `analyze_draft` env block.
     4. Set `league_key` to your league, e.g. 449.l.123456. The numeric prefix is
        Yahoo's game key and changes every season; a bare league id or the league
        URL also works and is completed using `game_key`.
     5. Enable the `poll_during_draft` trigger while the draft is running.
 
-  Unlike Sleeper, Yahoo publishes a real average draft position, so a player's
-  expected pick is their actual ADP rather than a rank standing in for one.
+  Unlike Sleeper and CBS, Yahoo publishes a real average draft position, so a
+  player's expected pick is their actual ADP rather than a rank standing in
+  for one.
 
   Yahoo access tokens last one hour, which is shorter than a draft, so the
   token is cached in the KV store and refreshed only once it is close to
@@ -141,12 +143,13 @@ tasks:
       YAHOO_BASE_URL: "{{ inputs.yahoo_base_url }}"
       YAHOO_TOKEN_URL: "{{ inputs.yahoo_token_url }}"
       # These come from the KV store rather than Namespace Secrets, whose
-      # backend is broken on the 2.0 RC this runs against (the secrets
-      # controller cannot choose between its JDBC and Elasticsearch beans).
+      # backend is disabled on this instance because `kestra.secret.type` is
+      # unset: with no primary SecretInterface bean, the controllers register
+      # against the two ungated ones in the image and then fail injection.
       # `kv()` errors on a missing key, so a half-configured namespace fails
       # loudly here rather than sending an unauthenticated request to Yahoo.
       # Trade-off: unlike `secret()`, KV values are NOT masked in execution
-      # logs. Move these back to `secret()` once the backend is fixed.
+      # logs. Move these back to `secret()` once the setting is in place.
       YAHOO_CLIENT_ID: "{{ kv('YAHOO_CLIENT_ID') }}"
       YAHOO_CLIENT_SECRET: "{{ kv('YAHOO_CLIENT_SECRET') }}"
       YAHOO_REFRESH_TOKEN: "{{ kv('YAHOO_REFRESH_TOKEN') }}"
@@ -203,12 +206,12 @@ tasks:
                 {{ outputs.analyze_draft.vars.analysis.high_value_alerts }} high-value player(s) still on the board.
 
                 Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }}
-                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU, PICK NOW{% endif %}
+                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot ?? 'unknown' }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick ?? false %} — THAT'S YOU, PICK NOW{% endif %}
 
                 Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
 
                 Best picks for my roster:
-                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ADP {{ item.expected_pick }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} — {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }} for {{ item.need }}){% endif %}
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{% if item.alert %}⭐ {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ADP {{ item.expected_pick | numberFormat('#.###') }}, still here at #{{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} — {{ item.need }}, score {{ item.adjusted_score | numberFormat('#.###') }}{% if item.need_penalty > 0 %} (value {{ item.value_score | numberFormat('#.###') }} less {{ item.need_penalty | numberFormat('#.###') }} for {{ item.need }}){% endif %}
                 {% endif %}{% endfor %}
           else:
             - id: status_update
@@ -216,14 +219,14 @@ tasks:
               message: |
                 Yahoo draft update: {{ outputs.analyze_draft.vars.analysis.draft_info.name }} ({{ outputs.analyze_draft.vars.analysis.league_key }}) — {{ outputs.analyze_draft.vars.analysis.timestamp }}
                 Round {{ outputs.analyze_draft.vars.analysis.draft_status.current_round }}, pick {{ outputs.analyze_draft.vars.analysis.draft_status.current_pick }} of {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} ({{ outputs.analyze_draft.vars.analysis.draft_status.picks_remaining }} remaining)
-                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick %} — THAT'S YOU{% endif %}
-                No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold }} picks past their ADP.
+                On the clock: draft slot {{ outputs.analyze_draft.vars.analysis.on_the_clock.slot ?? 'unknown' }}{% if outputs.analyze_draft.vars.analysis.on_the_clock.is_my_pick ?? false %} — THAT'S YOU{% endif %}
+                No one has fallen more than {{ outputs.analyze_draft.vars.analysis.alert_threshold | numberFormat('#.###') }} picks past their ADP.
 
                 My roster: {{ outputs.analyze_draft.vars.analysis.my_roster_summary }}
                 Starters still needed: {{ outputs.analyze_draft.vars.analysis.roster_needs.still_needed_summary }}
 
                 Best picks for my roster:
-                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ADP {{ item.expected_pick }}, {{ item.need }}, score {{ item.adjusted_score }}{% if item.need_penalty > 0 %} (value {{ item.value_score }} less {{ item.need_penalty }}){% endif %}
+                {% for item in outputs.analyze_draft.vars.analysis.recommendations %}{{ item.rank }}. {{ item.name }} ({{ item.position }} – {{ item.nfl_team }}) — ADP {{ item.expected_pick | numberFormat('#.###') }}, {{ item.need }}, score {{ item.adjusted_score | numberFormat('#.###') }}{% if item.need_penalty > 0 %} (value {{ item.value_score | numberFormat('#.###') }} less {{ item.need_penalty | numberFormat('#.###') }}){% endif %}
                 {% endfor %}
 
       pre_draft:
@@ -232,6 +235,7 @@ tasks:
           message: |
             Yahoo draft for {{ outputs.analyze_draft.vars.analysis.league_key }} has not started yet.
             {{ outputs.analyze_draft.vars.analysis.draft_status.teams }} teams × {{ outputs.analyze_draft.vars.analysis.draft_status.rounds }} rounds = {{ outputs.analyze_draft.vars.analysis.draft_status.total_picks }} picks.
+            {% if outputs.analyze_draft.vars.analysis.my_draft_slot ?? false %}Your draft slot: {{ outputs.analyze_draft.vars.analysis.my_draft_slot }}{% else %}Your draft slot is not known yet{% endif %}
 
       complete:
         - id: draft_finished

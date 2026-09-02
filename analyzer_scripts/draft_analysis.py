@@ -6,7 +6,7 @@ Everything here is independent of which fantasy platform the data came from:
 the value score, the roster-need penalties, snake-draft slot arithmetic, the
 Kestra output plumbing, and the disk cache.
 
-A provider module (Sleeper, Yahoo, ...) is responsible only for talking to its
+A provider module (Sleeper, Yahoo, CBS) is responsible only for talking to its
 API and normalizing the result into the shapes below; it then composes these
 helpers to produce the analysis payload.
 
@@ -504,8 +504,8 @@ def error_payload(message: str) -> Dict:
 def run_and_report(analyze: Callable[[], Dict]) -> int:
     """Run an analysis, publish it every way the flow expects, return an exit code.
 
-    Shared so both providers report identically: same output file, same Kestra
-    output key, same metrics, same summary format.
+    Shared so every provider reports identically: same output file, same
+    Kestra output key, same metrics, same summary format.
     """
     output_file = os.getenv("OUTPUT_FILE", "draft_analysis.json").strip()
 
